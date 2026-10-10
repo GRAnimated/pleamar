@@ -3435,6 +3435,8 @@ pub fn run(
             previous.forget();
             compose_memo = None;
         }
+        // (What is written to the card waits in memory for the next thing submitted to it.)
+        let wrote = !letters.pending_upload.is_empty() || !same_scene;
         g.upload_atlas(&mut letters.pending_upload);
         if !same_scene {
             g.upload(&draw);
@@ -3958,6 +3960,13 @@ pub fn run(
             if l.lens.is_some() && !std::mem::take(&mut l.painted_now) && l.capture == crate::gpu::BackdropCapture::Idle {
                 l.request_backdrop(true);
             }
+        }
+        // Nothing was painted —what changed is not seen on any sheet—: what was
+        // written for it is submitted on its own. Without this it piled up, and a
+        // scene whose logic moves something hidden every frame —a game put away
+        // into its corner— grew by a gigabyte an hour.
+        if wrote && painted == 0 {
+            g.flush();
         }
         // With queued vsync, the step was given by the wait of the one that sets the pace.
         // If it was not its turn to paint this time, the clock gives the step: a whole period.

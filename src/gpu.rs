@@ -2173,6 +2173,12 @@ impl Gpu {
         self.non_blocking == Some(wgpu::PresentMode::Mailbox) && std::env::var_os("PLEAMAR_FIFO").is_none()
     }
 
+    /// What was written and then not painted, to the card all the same: a write
+    /// is kept in memory until something is submitted, and this submits nothing else.
+    pub fn flush(&self) {
+        self.queue.submit(None::<wgpu::CommandBuffer>);
+    }
+
     pub fn upload_atlas(&self, pending_upload: &mut Vec<(AtlasSlot, Vec<u8>)>) {
         for (h, rgba) in pending_upload.drain(..) {
             self.queue.write_texture(
