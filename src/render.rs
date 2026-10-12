@@ -615,6 +615,15 @@ pub fn run(
     let mut prof_since = Instant::now();
     let mut prof_window_frames = 0u32;
     let mut prof_painted = 0u32;
+    let mut prof_awake = [0u32; 8];
+    // The thread's CPU outside the sections: taking what has arrived, at the
+    // start of a round, and waiting for its turn to paint.
+    let mut prof_outside = [0f64; 2];
+    let mut prof_arrived = [0u32; 10];
+    let mut prof_named: std::collections::HashMap<&'static str, u32> = std::collections::HashMap::new();
+    let mut prof_sheets: Vec<u32> = Vec::new();
+    let mut prof_moving: Option<usize> = None;
+    let mut prof_alive_by: Vec<String> = Vec::new();
     // This round's sections, and how long it waited for its turn to paint: a
     // slow frame says them, which an average of 300 does not.
     let mut sec = [0f64; 8];
@@ -734,6 +743,26 @@ pub fn run(
         // press is the zone's under where it was pressed, the moving and what
         // follows it, the next round's.
         let mut pressed = false;
+        if timing {
+            for m in &incoming {
+                let kind = match m {
+                    ToRender::Frame(_) => 0,
+                    ToRender::Cursor(..) => 1,
+                    ToRender::Pointer(_) => 2,
+                    ToRender::Fact(..) | ToRender::ExternalFact(..) => 3,
+                    ToRender::Text(..) => 4,
+                    ToRender::Command(_) => 5,
+                    ToRender::Workshop(_) => 6,
+                    ToRender::Backdrop(_) => 7,
+                    ToRender::Nest(_) => 8,
+                    _ => 9,
+                };
+                prof_arrived[kind] += 1;
+                if let ToRender::Fact(name, _) | ToRender::ExternalFact(name, _) | ToRender::Text(name, _) = m {
+                    *prof_named.entry(name).or_insert(0) += 1;
+                }
+            }
+        }
         for m in incoming {
             if pressed && matches!(m, ToRender::Pointer(_) | ToRender::Button(..) | ToRender::AgentButton(..)) {
                 held_back.push(m);
@@ -1779,7 +1808,9 @@ pub fn run(
         profiling = timing || probe.is_some();
         if profiling {
             prof_t = Instant::now();
-            prof_c = thread_cpu_ms();
+            let c = thread_cpu_ms();
+            prof_outside[0] += c - prof_c;
+            prof_c = c;
         }
         // The key that is still held down counts again.
         if let Some((name, typed, mods, when)) = &mut repeat {
@@ -2883,6 +2914,11 @@ pub fn run(
             .map(|r| scene.gestures[r.gesture].keyframes.iter().flat_map(|f| f.values.iter().map(|(p, _)| *p)).collect())
             .unwrap_or_default();
         let mut alive = plays;
+        // (`PLEAMAR_TIMING`) what keeps it alive, each by its name.
+        let mut alive_by: Vec<String> = Vec::new();
+        if timing && plays {
+            alive_by.push("the logic hears every frame".to_owned());
+        }
         let mut n_blink = 0;
         follows.begin(&scene.behaviors);
         for (k, behavior) in scene.behaviors.iter().enumerate() {
@@ -2923,6 +2959,9 @@ pub fn run(
                         } else {
                             props[prop.0 as usize].set((2.0 * t - 1.0).abs().powf(1.6));
                             alive = true;
+                            if timing {
+                                alive_by.push(format!("blink {}", scene.props[prop.0 as usize].0));
+                            }
                         }
                     }
                     appointments.push(*next);
@@ -2940,6 +2979,9 @@ pub fn run(
                     let a = amplitude.eval(Ctx { props: &props, facts: &facts });
                     props[prop.0 as usize].set(a * (t_total * frequency).sin());
                     alive |= a.abs() > 0.01;
+                    if timing && a.abs() > 0.01 {
+                        alive_by.push(format!("wave {}", scene.props[prop.0 as usize].0));
+                    }
                 }
                 Behavior::Follow { .. } | Behavior::Bind { .. } if absent_behaviors.iter().any(|r| r.contains(&k)) => {}
                 Behavior::Follow { prop, to } => {
@@ -2950,6 +2992,9 @@ pub fn run(
                     let v = follows.value(k, to, &props, &facts);
                     let p = &mut props[prop.0 as usize];
                     alive |= (p.x - v).abs() > 1e-3;
+                    if timing && (p.x - v).abs() > 1e-3 {
+                        alive_by.push(format!("{} bound to what changes", scene.props[prop.0 as usize].0));
+                    }
                     p.set(v);
                 }
                 Behavior::Advance { prop, per_second } => {
@@ -2977,6 +3022,9 @@ pub fn run(
                     a.x += v * dt;
                     a.target += v * dt;
                     alive |= v.abs() > 1e-4;
+                    if timing && v.abs() > 1e-4 {
+                        alive_by.push(format!("spin {}", scene.props[prop.0 as usize].0));
+                    }
                 }
                 Behavior::Gaze { x, y, center, reach, distance, rest } => {
                     let c = Ctx { props: &props, facts: &facts };
@@ -3013,6 +3061,9 @@ pub fn run(
         let mut gesture_ended = false;
         if let Some(r) = &mut gesture {
             alive = true;
+            if timing {
+                alive_by.push("a gesture".to_owned());
+            }
             let g = &scene.gestures[r.gesture];
             loop {
                 let f = &g.keyframes[r.keyframe];
@@ -3429,6 +3480,12 @@ pub fn run(
         // on from the next round (see `shader_clock`).
         if draw.timed && scene.shader_clock.is_some() {
             alive = true;
+            if timing {
+                alive_by.push("a shader that reads the time".to_owned());
+            }
+        }
+        if timing && draw.particles_alive {
+            alive_by.push("particles".to_owned());
         }
         // An image that moves: wake up when it changes frame.
         if let Some(t) = draw.wake_at {
@@ -3854,7 +3911,9 @@ pub fn run(
             let n = Instant::now();
             sec_wait = (n - prof_t).as_secs_f64() * 1000.0;
             prof_t = n;
-            prof_c = thread_cpu_ms();
+            let c = thread_cpu_ms();
+            prof_outside[1] += c - prof_c;
+            prof_c = c;
         }
         let before_painting = last_presented;
         last_presented = Instant::now();
@@ -3961,6 +4020,12 @@ pub fn run(
             l.painted = (was_painted && l.open).then_some(where_);
             waiting_for_screen |= was_painted && l.drives_pace && !g.uses_mailbox();
             painted += was_painted as u32;
+            if timing && was_painted {
+                if prof_sheets.len() <= l.view.surface {
+                    prof_sheets.resize(l.view.surface + 1, 0);
+                }
+                prof_sheets[l.view.surface] += 1;
+            }
         }
         // A sheet with a lens that has not painted this round has stayed
         // still: what is behind is watched. Watching while painting is no use,
@@ -3995,7 +4060,10 @@ pub fn run(
             sheet_counts.1 += up_to_date;
             sheet_counts.2 += 1;
             if sheet_counts.2 >= 300 {
-                println!("timing · surfaces per frame: {:.2} painted, {:.2} up to date", sheet_counts.0 as f32 / 300.0, sheet_counts.1 as f32 / 300.0);
+                // Which ones: a surface painted every round while nothing seems to move is what to look at.
+                let which: Vec<String> = prof_sheets.iter().enumerate().filter(|(_, n)| **n > 0).map(|(k, n)| format!("{} {n}", scene.surfaces.get(k).map_or("?", |s| if s.name.is_empty() { "the scene's own" } else { s.name.as_str() }))).collect();
+                println!("timing · surfaces per frame: {:.2} painted, {:.2} up to date{}", sheet_counts.0 as f32 / 300.0, sheet_counts.1 as f32 / 300.0, if which.is_empty() { String::new() } else { format!(" · painted, of 300 rounds: {}", which.join(", ")) });
+                prof_sheets.clear();
                 sheet_counts = (0, 0, 0);
                 // What is kept for the compositor's windows: over a long
                 // session, none of these should only grow.
@@ -4142,16 +4210,54 @@ pub fn run(
         }
         if timing {
             prof_frames += 1;
+            // Why this round does not end in rest: each reason, counted.
+            let moving = props.iter().position(|a| !a.at_rest());
+            for (k, yes) in [alive, something_happened, finger_light != 0.0 || ripple.is_some(), blocked, region_changes, measure_changed, keyboard_changed, moving.is_some()].into_iter().enumerate() {
+                prof_awake[k] += yes as u32;
+            }
+            if let Some(k) = moving {
+                prof_moving = Some(k);
+            }
+            for w in alive_by.drain(..) {
+                if prof_alive_by.len() < 8 && !prof_alive_by.contains(&w) {
+                    prof_alive_by.push(w);
+                }
+            }
             if prof_frames >= 300 {
                 let f = prof_frames as f64;
+                let why: Vec<String> = ["something alive", "something happened", "a light", "the logic busy", "regions", "a measure", "the keyboard", "a property moving"].iter().zip(prof_awake).filter(|(_, n)| *n > 0).map(|(w, n)| format!("{w} {n}")).collect();
+                if !why.is_empty() {
+                    println!(
+                        "timing · awake, of 300 rounds: {}{}{}",
+                        why.join(" · "),
+                        prof_moving.take().map_or(String::new(), |k| format!(" ({})", scene.props[k].0)),
+                        if prof_alive_by.is_empty() { String::new() } else { format!(" · alive: {}", std::mem::take(&mut prof_alive_by).join(", ")) }
+                    );
+                }
+                prof_awake = [0; 8];
                 println!(
                     "timing · {:.0} rounds, {:.0} windows' frames and {:.0} paintings a second · per round: input {:.2} · rules and springs {:.2} · windows' frames to the card {:.2} · compose {:.2} · regions {:.2} · paint {:.2} · rest {:.2} ms",
-                    f / prof_since.elapsed().as_secs_f64(), prof_window_frames as f64 / prof_since.elapsed().as_secs_f64(), prof_painted as f64 / prof_since.elapsed().as_secs_f64(), prof[0] / f, prof[1] / f, prof[7] / f, prof[3] / f, prof[4] / f, prof[5] / f, prof[6] / f
+                    f / prof_since.elapsed().as_secs_f64(), prof_window_frames as f64 / prof_since.elapsed().as_secs_f64(), prof_painted as f64 / prof_since.elapsed().as_secs_f64(), prof[0] / f, (prof[1] + prof[2]) / f, prof[7] / f, prof[3] / f, prof[4] / f, prof[5] / f, prof[6] / f
                 );
                 println!(
                     "timing · CPU per round: input {:.2} · rules and springs {:.2} · windows' frames to the card {:.2} · compose {:.2} · regions {:.2} · paint {:.2} · rest {:.2} ms",
-                    prof_cpu[0] / f, prof_cpu[1] / f, prof_cpu[7] / f, prof_cpu[3] / f, prof_cpu[4] / f, prof_cpu[5] / f, prof_cpu[6] / f
+                    prof_cpu[0] / f, (prof_cpu[1] + prof_cpu[2]) / f, prof_cpu[7] / f, prof_cpu[3] / f, prof_cpu[4] / f, prof_cpu[5] / f, prof_cpu[6] / f
                 );
+                // What the sections above leave out: a round that looks cheap and is not.
+                if prof_outside[0] + prof_outside[1] > 0.3 * f {
+                    let arrived: Vec<String> = ["frames shown", "the mouse elsewhere", "the mouse", "facts", "texts", "the logic's orders", "texts shaped", "pictures of what is behind", "windows", "other"].iter().zip(prof_arrived).filter(|(_, n)| *n > 0).map(|(w, n)| format!("{w} {n}")).collect();
+                    println!("timing · CPU per round outside those: what has arrived {:.2} · waiting its turn {:.2} ms · arrived, in 300 rounds: {}", prof_outside[0] / f, prof_outside[1] / f, arrived.join(", "));
+                }
+                // The facts and texts that arrive most: a service that says the same thing
+                // a hundred times a second is found by its name.
+                let mut most: Vec<(&str, u32)> = prof_named.drain().filter(|(_, n)| *n >= 30).collect();
+                most.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+                most.truncate(8);
+                if !most.is_empty() {
+                    println!("timing · told most, in 300 rounds: {}", most.iter().map(|(w, n)| format!("{w} {n}")).collect::<Vec<_>>().join(", "));
+                }
+                prof_arrived = [0; 10];
+                prof_outside = [0.0; 2];
                 prof_since = Instant::now();
                 prof_window_frames = 0;
                 prof_painted = 0;
