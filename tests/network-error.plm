@@ -1,0 +1,16 @@
+// expect: ok
+language 0.4
+// Why joining a network did not get in, read with no logic: a word a scene
+// decides by, as it does by `kind`.
+scene NetworkError {
+    surface { size: 300, 60 }
+    permissions { services: "network" }
+
+    service network as net {
+        online: bool
+        error: none | password | timeout | unsupported | busy | failed
+    }
+
+    text "That password did not open it" { at: 12, 12; size: 13; color: #f5f7f5; show: net.error == password }
+    text "It could not be joined" { at: 12, 34; size: 13; color: #f5f7f5; show: net.error != none and net.error != password }
+}

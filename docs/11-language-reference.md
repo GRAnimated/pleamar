@@ -331,6 +331,7 @@ What each service brings is in the vocabulary (§17), and **asking it for what i
 | `clock.time` · `clock.date` | already written out: `10:41`, `Sun 20 Sep` |
 | `audio.input` · `audio.input_muted` | the microphone: the same two, for what comes in |
 | `network.kind` | `none`, `wired` or `wifi` |
+| `network.error` | why the last attempt to join a network did not get in: `none` (it did, or none was made), `password` (wrong, or none given), `timeout`, `unsupported`, `busy` or `failed`. With iwd; with NetworkManager it stays `none`, and a network that was not joined is one that never turns `active` |
 | the `bool` ones | `muted`, `charging`, `present`, `online`, `playing` |
  Whatever does not come in a report stays as it was.
 
@@ -1537,7 +1538,7 @@ services.clock.seconds: hour minute second day month year weekday time date
 services.audio: volume muted input input_muted outputs inputs apps
 services.battery: present percent charging
 services.brightness: present level
-services.network: online kind name strength wifi networks
+services.network: online kind name strength wifi error networks
 services.bluetooth: present powered discovering devices
 services.media: playing title artist album length position rate art player players
 services.window: title class monitor list

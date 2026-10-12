@@ -1,9 +1,10 @@
 //! The network, through NetworkManager on the system bus: what it says and
 //! what it can be asked. It is told of changes (its signals), not polled; a
-//! system without NetworkManager falls back to what the kernel says
-//! (`system::network`), which can only be read.
+//! system without NetworkManager falls back to iwd (`iwd`), which answers the
+//! same, and with neither to what the kernel says (`system::network`), which
+//! can only be read.
 //!
-//! `{ online, kind = "wifi" | "wired" | "none", name, strength, wifi,
+//! `{ online, kind = "wifi" | "wired" | "none", name, strength, wifi, error,
 //!    networks = { { ssid, strength, secure, known, active }, … } }`: the
 //! connection in use, whether the wifi radio is on, and the networks in range,
 //! the strongest first (one per name), with whether one has been used before.
@@ -133,6 +134,8 @@ fn now(c: &Connection) -> SysValue {
         ("name".into(), SysValue::Text(name)),
         ("strength".into(), SysValue::Num(strength)),
         ("wifi".into(), SysValue::Bool(wifi_on)),
+        // A connection that does not get in is not told here yet: the network never turns `active`.
+        ("error".into(), text("none")),
         (
             "networks".into(),
             SysValue::List(
@@ -206,7 +209,7 @@ pub fn service(dispatch: Box<dyn Fn(SysValue) + Send>) -> bool {
 pub fn command(what: &str, args: &[SysValue]) -> Result<(), String> {
     let c = Connection::system().map_err(|e| e.to_string())?;
     if !present(&c) {
-        return Err("NetworkManager is not running: the network can only be read".into());
+        return Err("neither NetworkManager nor iwd is running: the network can only be read".into());
     }
     let nm = proxy(&c, NM_PATH, NM).ok_or("NetworkManager does not answer")?;
     let err = |e: zbus::Error| e.to_string();

@@ -118,8 +118,10 @@ fn start_service(from: &str, name: &str, notify: Box<dyn Fn(SysValue) + Send>) -
         "audio" => return system::audio(notify),
         "battery" => return system::battery(notify),
         "brightness" => return system::brightness(notify),
-        // NetworkManager, which can be asked things too; without it, the kernel.
+        // NetworkManager, which can be asked things too; without it iwd, which
+        // can as well; with neither, the kernel, which can only be read.
         "network" if networkmanager::available() => return networkmanager::service(notify),
+        "network" if iwd::available() => return iwd::service(notify),
         "network" => return system::network(notify),
         "bluetooth" if bluez::available() => return bluez::service(notify),
         "media" => return mpris::service(notify),
@@ -172,7 +174,7 @@ pub fn command(from: &str, name: &str, args: &[SysValue]) -> Result<(), String> 
     }
     #[cfg(target_os = "linux")]
     if name.starts_with("network.") {
-        return networkmanager::command(name, args);
+        return if !networkmanager::available() && iwd::available() { iwd::command(name, args) } else { networkmanager::command(name, args) };
     }
     #[cfg(target_os = "linux")]
     if name.starts_with("session.") {
@@ -947,6 +949,8 @@ mod hyprland;
 mod mpris;
 #[cfg(target_os = "linux")]
 mod networkmanager;
+#[cfg(target_os = "linux")]
+mod iwd;
 #[cfg(target_os = "linux")]
 mod bluez;
 #[cfg(target_os = "linux")]

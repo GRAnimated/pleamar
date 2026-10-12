@@ -329,22 +329,28 @@ pub fn brightness_command(what: &str, args: &[SysValue]) -> Result<(), String> {
 
 // ── network ───────────────────────────────────────────────────────
 
-/// `{ online, kind = "wired" | "wifi" | "none", name, strength }`. It comes from the
-/// kernel: the default route says which way traffic leaves, and `/proc/net/wireless`
-/// how well the wifi is getting through. The name is the wifi network's if `iw` can
-/// tell, and otherwise the interface's.
-fn network_now() -> SysValue {
+/// The interface the default route leaves by, and whether it is a wireless one:
+/// what the kernel knows of being connected, whoever brought the link up.
+pub(super) fn default_route() -> Option<(String, bool)> {
     let routes = std::fs::read_to_string("/proc/net/route").unwrap_or_default();
     // Interface · destination · gateway…: the default route is the one with destination 0.
     let interface = routes.lines().skip(1).find_map(|l| {
         let mut c = l.split_whitespace();
         let (name, destination) = (c.next()?, c.next()?);
         (destination == "00000000").then(|| name.to_owned())
-    });
-    let Some(interface) = interface else {
+    })?;
+    let wifi = std::path::Path::new(&format!("/sys/class/net/{interface}/wireless")).exists();
+    Some((interface, wifi))
+}
+
+/// `{ online, kind = "wired" | "wifi" | "none", name, strength }`. It comes from the
+/// kernel: the default route says which way traffic leaves, and `/proc/net/wireless`
+/// how well the wifi is getting through. The name is the wifi network's if `iw` can
+/// tell, and otherwise the interface's.
+fn network_now() -> SysValue {
+    let Some((interface, wifi)) = default_route() else {
         return SysValue::Map(vec![("online".into(), SysValue::Bool(false)), ("kind".into(), SysValue::Text("none".into())), ("name".into(), SysValue::Text(String::new())), ("strength".into(), SysValue::Num(0.0))]);
     };
-    let wifi = std::path::Path::new(&format!("/sys/class/net/{interface}/wireless")).exists();
     let mut name = interface.clone();
     let mut strength = 1.0;
     if wifi {
