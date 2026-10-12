@@ -172,6 +172,8 @@ curl -fsSL https://raw.githubusercontent.com/k4ditano/pleamar/main/install.sh | 
 | | |
 | --- | --- |
 | `pleamar-update` | new changes, built and put in place (it says what is new) |
+| `pleamar-update --alone` | pleamar alone from now on: pleamar-wm and Marea leave `~/.local/bin` |
+| `pleamar-update --all` | pleamar-wm and Marea too, from now on |
 | `pleamar-update --session` | also pleamar-wm in the login screen (asks for sudo) |
 | `pleamar-update --agent` | AI agents may use your windows in pleamar-wm, with a cursor of their own |
 | `pleamar-update --remote` | this desktop from a browser elsewhere: a password and codes made, and `pleamar-wm remote` started with the session |
@@ -181,6 +183,14 @@ It tells you what your distribution is missing to build it (pacman, apt, dnf,
 zypper) and offers to install it, builds in `~/.local/share/pleamar/src`, puts
 `pleamar`, `pleamar-wm`, `pleamar-session`, `marea` and `pleamar-update` in
 `~/.local/bin`, and makes your `~/.config/pleamar` the first time.
+
+**Only pleamar**, for the compositor you already use, without the window
+manager or Marea — fewer packages to build it, and `pleamar-update` keeps it
+that way:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/k4ditano/pleamar/main/install.sh | sh -s -- --alone
+```
 
 **Everything of yours lives in `~/.config/pleamar/`** — the folder for your
 dotfiles: your shells (`shells/`), what starts with the desktop (`autostart`;

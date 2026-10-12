@@ -4,6 +4,9 @@
 #   curl -fsSL https://raw.githubusercontent.com/k4ditano/pleamar/main/install.sh | sh
 #   ./install.sh                  install (or, if it is there, update)
 #   pleamar-update                update: new changes, built and put in place
+#   ./install.sh --alone          pleamar alone, without the window manager or Marea
+#                                 (… | sh -s -- --alone); it stays so on every update
+#   pleamar-update --all          the window manager and Marea too, from then on
 #   pleamar-update --session      also puts pleamar-wm in the login screen (asks for sudo)
 #   pleamar-update --agent        lets AI agents use your desktop in pleamar-wm, with a
 #                                 pointer and a keyboard of their own (Cua Driver too)
@@ -14,6 +17,7 @@
 # What it installs, all in your home and nothing else:
 #   ~/.local/share/pleamar/src/   pleamar, pleamar-wm and Marea's source (git)
 #   ~/.local/bin/                 pleamar, pleamar-wm, pleamar-session, marea, pleamar-update
+#                                 (alone: pleamar and pleamar-update, and only its source)
 #   ~/.config/pleamar/            your configuration, made once and never written over
 #   the AI agents you have        pleamar's skills (Claude Code, Codex, OpenCode): to
 #                                 build with pleamar, and to use the desktop in pleamar-wm
@@ -25,23 +29,47 @@ set -eu
 repo_base="${PLEAMAR_REPOS:-https://github.com/k4ditano}"
 repos="pleamar pleamar-wm marea-plm"
 bin="${PLEAMAR_BIN:-$HOME/.local/bin}"
+# The autostart of pleamar alone, to start from.
+alone_autostart() {
+    cat << 'EOF'
+# What starts with the desktop, one command a line, run with `sh -c`:
+# `pleamar --autostart` starts it all (on Hyprland: `exec-once = pleamar --autostart`).
+# Your scenes (bars, widgets, apps) go in ~/.config/pleamar/shells.
+#
+# pleamar --scene ~/.config/pleamar/shells/bar.plm
+EOF
+}
 say() { printf '\033[1;36mpleamar ·\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31mpleamar ·\033[0m %s\n' "$*" >&2; exit 1; }
 
 session=false
 agent=false
 remote=false
+alone=""
 action=install
 for a in "$@"; do
     case "$a" in
         --session) session=true ;;
         --agent) agent=true ;;
         --remote) remote=true ;;
+        --alone) alone=true ;;
+        --all) alone=false ;;
         --uninstall) action=uninstall ;;
-        --help|-h) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        *) fail "I don't know «$a» (--session, --agent, --remote, --uninstall, --help)" ;;
+        --help|-h) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        *) fail "I don't know «$a» (--alone, --all, --session, --agent, --remote, --uninstall, --help)" ;;
     esac
 done
+# pleamar alone: asked for now, or what was asked for when it was installed
+# (remembered beside the programs, so an update keeps it).
+if [ -z "$alone" ]; then
+    if [ -f "$bin/.pleamar-alone" ]; then alone=true; else alone=false; fi
+fi
+if $alone; then
+    repos="pleamar"
+    for o in session agent remote; do
+        if eval "\$$o"; then fail "--$o is pleamar-wm's, and this is pleamar alone (pleamar-update --all brings it)"; fi
+    done
+fi
 
 # Where the source is: PLEAMAR_SRC; or, run from inside a copy of pleamar that
 # has the other two beside it, that folder; or its own place in your home.
@@ -62,7 +90,7 @@ managed=false
 [ "${PLEAMAR_PULL:-}" = 1 ] && managed=true
 
 if [ "$action" = uninstall ]; then
-    for f in pleamar pleamar-wm pleamar-session marea pleamar-update .pleamar-src; do
+    for f in pleamar pleamar-wm pleamar-wm-stream pleamar-session marea pleamar-update .pleamar-src .pleamar-alone; do
         rm -f "$bin/$f"
     done
     say "the programs are gone from $bin"
@@ -83,10 +111,15 @@ command -v cargo > /dev/null || missing="$missing cargo"
 command -v cc > /dev/null || command -v gcc > /dev/null || missing="$missing a-C-compiler"
 command -v c++ > /dev/null || command -v g++ > /dev/null || command -v clang++ > /dev/null || missing="$missing a-C++-compiler"
 # PipeWire's bindings (pleamar-wm shares the screen) are made with libclang.
-command -v clang > /dev/null || missing="$missing clang"
+$alone || command -v clang > /dev/null || missing="$missing clang"
 if command -v pkg-config > /dev/null; then
-    # openssl: pleamar-wm remote's direct way (WebRTC) encrypts with it.
-    for lib in libinput libseat libudev gbm xkbcommon libpipewire-0.3 openssl; do
+    # pleamar's own: Wayland, the keyboard's layouts, and PAM (the lock screen
+    # checks the password with it; older ones come without a .pc file).
+    libs="wayland-client xkbcommon"
+    pkg-config --exists pam || [ -e /usr/include/security/pam_appl.h ] || missing="$missing pam"
+    # pleamar-wm's. openssl: its remote's direct way (WebRTC) encrypts with it.
+    $alone || libs="$libs libinput libseat libudev gbm libpipewire-0.3 openssl"
+    for lib in $libs; do
         pkg-config --exists "$lib" || missing="$missing $lib"
     done
 else
@@ -94,14 +127,19 @@ else
 fi
 if [ -n "$missing" ]; then
     say "to build it, this is missing:$missing"
+    # What pleamar asks for, and after it what pleamar-wm adds.
     if command -v pacman > /dev/null; then
-        hint="sudo pacman -S --needed git rust base-devel pkgconf clang libinput seatd libxkbcommon mesa vulkan-icd-loader xorg-xwayland pipewire openssl"
+        hint="sudo pacman -S --needed git rust base-devel pkgconf wayland libxkbcommon pam vulkan-icd-loader"
+        $alone || hint="$hint clang libinput seatd mesa xorg-xwayland pipewire openssl"
     elif command -v apt > /dev/null; then
-        hint="sudo apt install git cargo build-essential pkg-config clang libclang-dev libinput-dev libseat-dev libudev-dev libgbm-dev libxkbcommon-dev libvulkan1 xwayland libpipewire-0.3-dev libssl-dev"
+        hint="sudo apt install git cargo build-essential pkg-config libwayland-dev libxkbcommon-dev libpam0g-dev libvulkan1"
+        $alone || hint="$hint clang libclang-dev libinput-dev libseat-dev libudev-dev libgbm-dev xwayland libpipewire-0.3-dev libssl-dev"
     elif command -v dnf > /dev/null; then
-        hint="sudo dnf install git cargo gcc-c++ pkgconf clang-devel libinput-devel libseat-devel systemd-devel mesa-libgbm-devel libxkbcommon-devel vulkan-loader xorg-x11-server-Xwayland pipewire-devel openssl-devel"
+        hint="sudo dnf install git cargo gcc-c++ pkgconf wayland-devel libxkbcommon-devel pam-devel vulkan-loader"
+        $alone || hint="$hint clang-devel libinput-devel libseat-devel systemd-devel mesa-libgbm-devel xorg-x11-server-Xwayland pipewire-devel openssl-devel"
     elif command -v zypper > /dev/null; then
-        hint="sudo zypper install git cargo gcc-c++ pkgconf libinput-devel libseat-devel systemd-devel libgbm-devel libxkbcommon-devel libvulkan1 xwayland libopenssl-devel"
+        hint="sudo zypper install git cargo gcc-c++ pkgconf wayland-devel libxkbcommon-devel pam-devel libvulkan1"
+        $alone || hint="$hint libinput-devel libseat-devel systemd-devel libgbm-devel xwayland libopenssl-devel"
     else
         hint="your distribution's packages for:$missing"
     fi
@@ -140,31 +178,65 @@ for r in $repos; do
 done
 
 # ── built ──────────────────────────────────────────────────────────
-say "building pleamar and pleamar-wm (the first time takes a few minutes)"
+if $alone; then
+    say "building pleamar (the first time takes a few minutes)"
+else
+    say "building pleamar and pleamar-wm (the first time takes a few minutes)"
+fi
 (cd "$src/pleamar" && cargo build --release --quiet) || fail "pleamar did not build"
-(cd "$src/pleamar-wm" && cargo build --release --quiet) || fail "pleamar-wm did not build"
-# The remote desktop's video (pleamar-wm-stream): it needs ffmpeg's
-# development files; without them the remote uses wf-recorder.
-if $remote || [ -x "$bin/pleamar-wm-stream" ]; then
-    (cd "$src/pleamar-wm" && cargo build --release --quiet -p pleamar-wm-stream) || say "remote: its own video did not build (ffmpeg's development files?): wf-recorder is used"
+if ! $alone; then
+    (cd "$src/pleamar-wm" && cargo build --release --quiet) || fail "pleamar-wm did not build"
+    # The remote desktop's video (pleamar-wm-stream): it needs ffmpeg's
+    # development files; without them the remote uses wf-recorder.
+    if $remote || [ -x "$bin/pleamar-wm-stream" ]; then
+        (cd "$src/pleamar-wm" && cargo build --release --quiet -p pleamar-wm-stream) || say "remote: its own video did not build (ffmpeg's development files?): wf-recorder is used"
+    fi
 fi
 
 # ── put in place ───────────────────────────────────────────────────
 # Copied, not linked: a build half-way through never leaves a broken program.
 mkdir -p "$bin"
-for p in pleamar/target/release/pleamar pleamar-wm/target/release/pleamar-wm pleamar-wm/target/release/pleamar-wm-stream; do
+built="pleamar/target/release/pleamar"
+$alone || built="$built pleamar-wm/target/release/pleamar-wm pleamar-wm/target/release/pleamar-wm-stream"
+for p in $built; do
     [ -x "$src/$p" ] || continue
     install -m755 "$src/$p" "$bin/$(basename "$p").new"
     mv -f "$bin/$(basename "$p").new" "$bin/$(basename "$p")"
 done
-install -m755 "$src/pleamar-wm/session.sh" "$bin/pleamar-session"
-# Marea runs from her folder (her scene, her images): a link to her launcher.
-ln -sf "$src/marea-plm/marea" "$bin/marea"
 install -m755 "$src/pleamar/install.sh" "$bin/pleamar-update"
 echo "$src" > "$bin/.pleamar-src"
-
-# Your folder, the first time; never over what is there.
-"$bin/pleamar-wm" init > /dev/null
+cfg="${XDG_CONFIG_HOME:-$HOME/.config}/pleamar"
+if $alone; then
+    # What was here of the rest goes: left, it would never be brought up to date.
+    gone=""
+    for f in pleamar-wm pleamar-wm-stream pleamar-session marea; do
+        [ -e "$bin/$f" ] || [ -L "$bin/$f" ] || continue
+        rm -f "$bin/$f"
+        gone="$gone $f"
+    done
+    [ -z "$gone" ] || say "taken away, being pleamar-wm's and Marea's:$gone (back with pleamar-update --all)"
+    : > "$bin/.pleamar-alone"
+    # Your folder, the first time; never over what is there.
+    mkdir -p "$cfg/shells"
+    [ -e "$cfg/autostart" ] || alone_autostart > "$cfg/autostart"
+else
+    # Coming from pleamar alone: the autostart made for it, if nothing was
+    # written in it, gives way to pleamar-wm's (Marea, the wallpaper, who asks
+    # for the password).
+    if [ -f "$bin/.pleamar-alone" ] && [ -f "$cfg/autostart" ]; then
+        if [ "$(cat "$cfg/autostart")" = "$(alone_autostart)" ]; then
+            rm -f "$cfg/autostart"
+        elif ! grep -qE '^[[:space:]]*(wm:|marea)' "$cfg/autostart"; then
+            say "your autostart starts neither Marea nor anything of pleamar-wm's session: its lines are in $src/pleamar-wm/autostart"
+        fi
+    fi
+    rm -f "$bin/.pleamar-alone"
+    install -m755 "$src/pleamar-wm/session.sh" "$bin/pleamar-session"
+    # Marea runs from her folder (her scene, her images): a link to her launcher.
+    ln -sf "$src/marea-plm/marea" "$bin/marea"
+    # Your folder, the first time; never over what is there.
+    "$bin/pleamar-wm" init > /dev/null
+fi
 # The AI agents you have learn pleamar (and it refreshes itself on updates).
 "$bin/pleamar" --install-skill | sed 's/^/    /'
 
@@ -172,7 +244,7 @@ echo "$src" > "$bin/.pleamar-src"
 # An agent gets a pointer and a keyboard of its own in pleamar-wm: it types
 # and clicks in a window while yours stay free, and the monitor it works on
 # shows it. Off unless asked for: whatever has it can type anywhere.
-conf="${XDG_CONFIG_HOME:-$HOME/.config}/pleamar/session.conf"
+conf="$cfg/session.conf"
 if $agent; then
     if grep -qE '^[[:space:]]*agent[[:space:]]+on' "$conf" 2> /dev/null; then
         say "computer use: already on"
@@ -268,6 +340,19 @@ case ":$PATH:" in
     *":$bin:"*) ;;
     *) say "add $bin to your PATH (in ~/.profile: export PATH=\"$bin:\$PATH\")" ;;
 esac
+if $alone; then
+    cat << EOF
+
+  Your things:      ~/.config/pleamar   (autostart, shells/)
+  Try it:           pleamar --scene $src/pleamar/examples/bar.plm
+  With the desktop: pleamar --autostart   (on Hyprland: exec-once = pleamar --autostart)
+  Up to date:       pleamar-update
+  All of it:        pleamar-update --all   the pleamar-wm window manager and Marea too
+  Docs:             pleamar --docs      Ask your AI agent: it knows pleamar now.
+
+EOF
+    exit 0
+fi
 cat << EOF
 
   Your things:      ~/.config/pleamar   (session.conf, keys.conf, autostart, shells/, wm/)
