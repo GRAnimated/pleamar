@@ -1099,7 +1099,7 @@ mod tests {
             .collect();
         let never = |_: usize| false;
         let sight = Sight { shown, texts_seen: seen, gone: &never, rank: None };
-        describe(&scene, Ctx { props: &props, facts: &facts }, &texts, &sight)
+        describe(&scene, Ctx { props: &props, facts: &facts, seen: None }, &texts, &sight)
     }
 
     fn node<'p>(parts: &'p [Part], name: &str) -> Option<&'p Node> {
@@ -1166,7 +1166,7 @@ mod tests {
         let (scene, _) = crate::language::read_file(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/agent.plm")).unwrap();
         let props: Vec<Animated> = scene.props.iter().map(|(_, v, s)| Animated { x: *v, v: 0.0, target: *v, spring: *s }).collect();
         let facts: Vec<f32> = scene.facts.iter().map(|f| f.1).collect();
-        let c = Ctx { props: &props, facts: &facts };
+        let c = Ctx { props: &props, facts: &facts, seen: None };
         let shown = vec![Shown { surface: 0, popup: None, bounds: [0.0, 0.0, 400.0, 300.0], scale: 1.0 }];
         let never = |_: usize| false;
         let sight = Sight { shown, texts_seen: &[], gone: &never, rank: None };
@@ -1184,7 +1184,7 @@ mod tests {
         let props: Vec<Animated> = scene.props.iter().map(|(_, v, s)| Animated { x: *v, v: 0.0, target: *v, spring: *s }).collect();
         let mut facts: Vec<f32> = scene.facts.iter().map(|f| f.1).collect();
         let texts: Vec<String> = scene.texts.iter().map(|t| t.1.clone()).collect();
-        let holds = |src: &str, facts: &[f32]| Cond::parse(&scene, src).unwrap().0.holds(&scene, Ctx { props: &props, facts }, &texts);
+        let holds = |src: &str, facts: &[f32]| Cond::parse(&scene, src).unwrap().0.holds(&scene, Ctx { props: &props, facts, seen: None }, &texts);
         assert!(holds("dirty == false", &facts));
         assert!(holds("status has \"Rea\" and not dirty", &facts));
         assert!(!holds("status == \"Saved\" or dirty", &facts));

@@ -365,6 +365,9 @@ pub fn content_text<'t>(content: &'t Content, c: Ctx, texts: &'t [String]) -> st
         }
         // The version of the language the `locale` fact says.
         Content::Translated { locale, versions } => {
+            if let Some(s) = c.seen {
+                s.fact(locale.0 as usize);
+            }
             let k = (c.facts[locale.0 as usize].round().max(0.0) as usize).min(versions.len().saturating_sub(1));
             content_text(&versions[k], c, texts)
         }

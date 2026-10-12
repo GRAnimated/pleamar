@@ -421,6 +421,8 @@ pub fn run(
     let mut previous = crate::gpu::PreviousFrame::default();
     // What the last list was made from (see `same_scene`).
     let mut compose_memo: Option<ComposeMemo> = None;
+    // What the drawing read the last time it was made.
+    let mut compose_seen = crate::scene::Seen::default();
     // Who asked what the scene holds (`describe`): answered after the next
     // list is made, which is when where every text went is known.
     let mut describing: Vec<(bool, std::sync::mpsc::Sender<String>)> = Vec::new();
@@ -1145,7 +1147,7 @@ pub fn run(
                     }
                 },
                 ToRender::Watch(lines, until) => {
-                    let c = Ctx { props: &props, facts: &facts };
+                    let c = Ctx { props: &props, facts: &facts, seen: None };
                     let _ = lines.send(format!("watching for {:.0} s", until.saturating_duration_since(Instant::now()).as_secs_f32()));
                     watchers.push(Watcher { lines, until, start: Instant::now(), before: crate::agent::before(&scene, c, &texts, open_surfaces(&scene, &sheets)) });
                 }
@@ -1643,7 +1645,7 @@ pub fn run(
         }
         // ── an agent's hand ─────────────────────────────────────
         if acting.is_some() || !acts.is_empty() {
-            let c = Ctx { props: &props, facts: &facts };
+            let c = Ctx { props: &props, facts: &facts, seen: None };
             let absent: Vec<std::ops::Range<usize>> = scene.spans.iter().filter(|t| scene.surfaces.get(t.surface).is_some_and(|s| s.instance > 0) && !sheets.iter().any(|l| l.view.surface == t.surface)).map(|t| t.instrs.clone()).collect();
             let gone = |at: usize| draw.hidden.get(at).copied().unwrap_or(false) || absent.iter().any(|r| r.contains(&at));
             let rank = z_memo.as_ref().and_then(|(_, a)| a.as_ref()).map(|a| a.zone_rank.clone());
@@ -1884,7 +1886,7 @@ pub fn run(
             // the keyboard. With a rule —`on key Super+Return`—, to the scene.
             // (A rule whose `while` does not hold now does not take it: `on key
             // Escape while overview` leaves Esc to the windows the rest of the time.)
-            let the_scenes = scene.rules.iter().any(|r| matches!(&r.when, Trigger::Key(t) if *t == combo) && r.guard.as_ref().is_none_or(|g| g.is_true(Ctx { props: &props, facts: &facts })));
+            let the_scenes = scene.rules.iter().any(|r| matches!(&r.when, Trigger::Key(t) if *t == combo) && r.guard.as_ref().is_none_or(|g| g.is_true(Ctx { props: &props, facts: &facts, seen: None })));
             if let Some(send) = &nest {
                 let focus = scene.nest.as_ref().and_then(|n| scene.facts.iter().position(|h| h.0 == format!("{}.focus", n.name))).map_or(-1.0, |k| facts[k]);
                 if !the_scenes && code != 0 && focus >= 0.0 {
@@ -1971,7 +1973,7 @@ pub fn run(
         // Zones: who has the mouse over them.
         let mut edges: Vec<(bool, usize)> = Vec::new(); // (enters, zone)
         {
-            let c = Ctx { props: &props, facts: &facts };
+            let c = Ctx { props: &props, facts: &facts, seen: None };
             for (k, (z, was_inside)) in scene.zones.iter().zip(inside.iter_mut()).enumerate() {
                 let is_inside = !draw.hidden.get(z.at).copied().unwrap_or(false) && !absent.iter().any(|r| r.contains(&z.at)) && z.active.is_true(c) && pointer.is_some_and(|(x, y)| z.contains(c, x, y));
                 if is_inside != *was_inside {
@@ -1985,7 +1987,7 @@ pub fn run(
         // one drawn last.
         // Worked out again only when some `z:` changed: it walks the whole drawing.
         let arrangement = {
-            let c = Ctx { props: &props, facts: &facts };
+            let c = Ctx { props: &props, facts: &facts, seen: None };
             let zs: Vec<f32> = scene.zblocks.iter().map(|b| b.z.eval(c)).collect();
             if z_memo.as_ref().is_none_or(|(before, _)| *before != zs) {
                 z_memo = Some((zs, scene.z_arrange(c)));
@@ -2063,7 +2065,7 @@ pub fn run(
                         // Clicking a field focuses it, with the cursor where the click landed.
                         let id = scene.zones[k].id;
                         if let Some(placed) = draw.fields.iter().find(|c| c.zone == id) {
-                            let local = scene.zones[k].to_local(Ctx { props: &props, facts: &facts }, p.0, p.1);
+                            let local = scene.zones[k].to_local(Ctx { props: &props, facts: &facts, seen: None }, p.0, p.1);
                             let b = placed.layout.as_ref().map_or(0, |m| m.byte_at_x(local.0 - placed.x0 + placed.scroll));
                             let b = if placed.secret { crate::gpu::unmasked_byte(&texts[placed.text], b) } else { b };
                             let b = b.min(texts[placed.text].len());
@@ -2104,7 +2106,7 @@ pub fn run(
             if let Some(content) = scene.zones.get(k).and_then(|z| z.carries.as_ref()) {
                 if carry_tried != Some(k) && (p.0 - from.0).hypot(p.1 - from.1) > 8.0 {
                     carry_tried = Some(k);
-                    let text = crate::gpu::content_text(content, Ctx { props: &props, facts: &facts }, &texts).into_owned();
+                    let text = crate::gpu::content_text(content, Ctx { props: &props, facts: &facts, seen: None }, &texts).into_owned();
                     if crate::platform::start_drag(&text) {
                         let _ = to_logic.send(Event::Release(scene.zones[k].id));
                         drag = None;
@@ -2275,7 +2277,7 @@ pub fn run(
             } else {
                 seen_cursor
             };
-            let local = focus.and_then(|k| scene.zones.get(k)).map_or((px, py), |z| z.to_local(Ctx { props: &props, facts: &facts }, px, py));
+            let local = focus.and_then(|k| scene.zones.get(k)).map_or((px, py), |z| z.to_local(Ctx { props: &props, facts: &facts, seen: None }, px, py));
             let (dx, dy) = drag.map_or((0.0, 0.0), |(_, o, _)| (px - o.0, py - o.1));
             for (k, (name, _)) in scene.facts.iter().enumerate() {
                 match *name {
@@ -2303,7 +2305,7 @@ pub fn run(
         // keep it. And if it asked for the focus for a field without having it,
         // exclusively until it arrives (see `Effect::FocusField`).
         let keyboard_wanted = match &scene.keyboard_while {
-            Some(when) => when.is_true(Ctx { props: &props, facts: &facts }),
+            Some(when) => when.is_true(Ctx { props: &props, facts: &facts, seen: None }),
             None => true,
         };
         // The loan lasts while the scene wants the keyboard: giving it back on
@@ -2358,7 +2360,7 @@ pub fn run(
                     .iter()
                     .filter(|f| f.text == e.field)
                     .flat_map(|f| scene.zones.iter().filter(move |z| z.id == f.zone))
-                    .filter_map(|z| z.bounds(Ctx { props: &props, facts: &facts }))
+                    .filter_map(|z| z.bounds(Ctx { props: &props, facts: &facts, seen: None }))
                     .collect()
             })
             .unwrap_or_default();
@@ -2413,7 +2415,7 @@ pub fn run(
         // there: `each max 4` with one monitor was four times the scene's rules
         // every frame, for three copies nobody sees. The first copy always runs.
         let asleep: Vec<&crate::scene::Span> = {
-            let c = Ctx { props: &props, facts: &facts };
+            let c = Ctx { props: &props, facts: &facts, seen: None };
             let shown = |k: usize| sheets.iter().any(|l| l.view.surface == k);
             scene
                 .spans
@@ -2428,7 +2430,7 @@ pub fn run(
 
         // Rules: all of this happens here, whatever state the logic is in.
         {
-            let c = Ctx { props: &props, facts: &facts };
+            let c = Ctx { props: &props, facts: &facts, seen: None };
             let mut acted: Vec<usize> = Vec::new();
             for (k, (r, e)) in scene.rules.iter().zip(rules.iter_mut()).enumerate() {
                 if rule_asleep(k) {
@@ -2571,7 +2573,7 @@ pub fn run(
                     // A fact that a rule changes is told to the logic, which otherwise
                     // would go on believing what it said itself the last time.
                     Effect::Fact(h, v) => {
-                        let v = v.eval(Ctx { props: &props, facts: &facts });
+                        let v = v.eval(Ctx { props: &props, facts: &facts, seen: None });
                         facts[h.0 as usize] = v;
                         let _ = to_logic.send(Event::Fact(scene.facts[h.0 as usize].0, v));
                     }
@@ -2581,16 +2583,16 @@ pub fn run(
                         let _ = to_logic.send(Event::Fact(scene.facts[h.0 as usize].0, v));
                     }
                     Effect::Signal(s, payload) => {
-                        let v = payload.as_ref().map(|e| e.eval(Ctx { props: &props, facts: &facts }));
+                        let v = payload.as_ref().map(|e| e.eval(Ctx { props: &props, facts: &facts, seen: None }));
                         signals.push((s.0 as usize, false, v));
                     }
                     Effect::Impulse(p, v) => {
-                        let v = v.eval(Ctx { props: &props, facts: &facts });
+                        let v = v.eval(Ctx { props: &props, facts: &facts, seen: None });
                         props[p.0 as usize].v += v;
                     }
                     Effect::Gesture(g) => gestures_asked.push(g.0 as usize),
                     Effect::Window(action, which) => {
-                        let slot = which.eval(Ctx { props: &props, facts: &facts }).round();
+                        let slot = which.eval(Ctx { props: &props, facts: &facts, seen: None }).round();
                         if let (Some(send), true) = (&nest, slot >= 0.0) {
                             let slot = slot as usize;
                             send(match action {
@@ -2606,7 +2608,7 @@ pub fn run(
                         }
                     }
                     Effect::WindowTo(which, to) => {
-                        let c = Ctx { props: &props, facts: &facts };
+                        let c = Ctx { props: &props, facts: &facts, seen: None };
                         let (slot, screen) = (which.eval(c).round(), to.eval(c).round());
                         if let (Some(send), true) = (&nest, slot >= 0.0 && screen >= 0.0) {
                             send(ToNest::Send(slot as usize, screen as usize));
@@ -2615,7 +2617,7 @@ pub fn run(
                     // A workspace shown: its windows come, the others go, and the
                     // keyboard goes to the one that last had it there.
                     Effect::Workspace(ws, on) => {
-                        let c = Ctx { props: &props, facts: &facts };
+                        let c = Ctx { props: &props, facts: &facts, seen: None };
                         let ws = ws.eval(c).round().max(1.0) as usize;
                         let screen = on.map_or(nest_on_screen.unwrap_or(0) as f32, |e| e.eval(c)).round().clamp(0.0, 3.0) as usize;
                         if let Some(n) = scene.nest.clone() {
@@ -2642,7 +2644,7 @@ pub fn run(
                         }
                     }
                     Effect::WindowToWorkspace(which, to, on) => {
-                        let c = Ctx { props: &props, facts: &facts };
+                        let c = Ctx { props: &props, facts: &facts, seen: None };
                         let (slot, ws) = (which.eval(c).round(), to.eval(c).round().max(1.0) as usize);
                         let on = on.as_ref().map(|e| e.eval(c).round().clamp(0.0, 3.0) as usize);
                         if let (Some(n), true) = (scene.nest.clone(), slot >= 0.0) {
@@ -2670,7 +2672,7 @@ pub fn run(
                     // keyboard—, brought back if it was put away; or its program started.
                     Effect::Dock(k, on, what) => {
                         let what = what.clone();
-                        let c = Ctx { props: &props, facts: &facts };
+                        let c = Ctx { props: &props, facts: &facts, seen: None };
                         let k = k.eval(c).round();
                         let screen = on.map_or(nest_on_screen.unwrap_or(0) as f32, |e| e.eval(c)).round().clamp(0.0, 3.0) as usize;
                         if let (Some(n), Some(send), true) = (scene.nest.clone(), &nest, k >= 0.0) {
@@ -2712,7 +2714,7 @@ pub fn run(
                     // end of that one's stack and is shown there; this one shows the
                     // pool beside it.
                     Effect::WorkspaceTo(ws, on, to) => {
-                        let c = Ctx { props: &props, facts: &facts };
+                        let c = Ctx { props: &props, facts: &facts, seen: None };
                         let ws = ws.eval(c).round().max(1.0) as usize;
                         let from = on.map_or(nest_on_screen.unwrap_or(0) as f32, |e| e.eval(c)).round().clamp(0.0, 3.0) as usize;
                         let to = to.eval(c).round().clamp(0.0, 3.0) as usize;
@@ -2743,14 +2745,14 @@ pub fn run(
                         }
                     }
                     Effect::WindowSwap(a, b) => {
-                        let c = Ctx { props: &props, facts: &facts };
+                        let c = Ctx { props: &props, facts: &facts, seen: None };
                         let (a, b) = (a.eval(c).round(), b.eval(c).round());
                         if let (Some(send), true) = (&nest, a >= 0.0 && b >= 0.0 && a != b) {
                             send(ToNest::Swap(a as usize, b as usize));
                         }
                     }
                     Effect::Pick(what) => {
-                        let c = Ctx { props: &props, facts: &facts };
+                        let c = Ctx { props: &props, facts: &facts, seen: None };
                         let picked = what.as_ref().and_then(|(window, e)| {
                             let k = e.eval(c).round();
                             (k >= 0.0).then(|| if *window { crate::scene::Picked::Window(k as usize) } else { crate::scene::Picked::Screen(k as usize) })
@@ -2818,7 +2820,7 @@ pub fn run(
                     // `on chosen(v)`: the value it arrived with, put in now —the
                     // effects are applied later, mixed with other events'—.
                     let v = payload.unwrap_or(0.0);
-                    let guard_ok = r.guard.as_ref().is_none_or(|guard| guard.with_payload(v).is_true(Ctx { props: &props, facts: &facts }));
+                    let guard_ok = r.guard.as_ref().is_none_or(|guard| guard.with_payload(v).is_true(Ctx { props: &props, facts: &facts, seen: None }));
                     if guard_ok {
                         effects.extend(r.effects.iter().map(|e| if payload.is_some() { e.with_payload(v) } else { e.clone() }));
                     }
@@ -2836,14 +2838,14 @@ pub fn run(
                     let _ = to_logic.send(Event::GestureRejected(requested.name));
                     continue;
                 }
-                gesture = Some(Playback::start(g, requested, &scene.pose, Ctx { props: &props, facts: &facts }, now, op.reduced_motion));
+                gesture = Some(Playback::start(g, requested, &scene.pose, Ctx { props: &props, facts: &facts, seen: None }, now, op.reduced_motion));
             }
         }
 
         pending.retain(|(when, t)| {
             if *when <= now {
                 // The destination is computed now, not when it was declared.
-                let target = t.to.eval(Ctx { props: &props, facts: &facts });
+                let target = t.to.eval(Ctx { props: &props, facts: &facts, seen: None });
                 let a = &mut props[t.prop.0 as usize];
                 a.target = target;
                 // At once: there, still, and it keeps its own spring for what comes after.
@@ -2864,7 +2866,7 @@ pub fn run(
 
         // Layers: the first claim that holds wins.
         for (layer, st) in scene.layers.iter().zip(layers.iter_mut()) {
-            let c = Ctx { props: &props, facts: &facts };
+            let c = Ctx { props: &props, facts: &facts, seen: None };
             let winner = layer
                 .claims
                 .iter()
@@ -2894,7 +2896,7 @@ pub fn run(
                 }
                 for t in &r.sets {
                     if first_time {
-                        let v = t.to.eval(Ctx { props: &props, facts: &facts });
+                        let v = t.to.eval(Ctx { props: &props, facts: &facts, seen: None });
                         props[t.prop.0 as usize].set(v);
                     } else {
                         pending.push((now + t.delay, t.clone()));
@@ -2976,7 +2978,7 @@ pub fn run(
                         props[prop.0 as usize].set(0.0);
                         continue;
                     }
-                    let a = amplitude.eval(Ctx { props: &props, facts: &facts });
+                    let a = amplitude.eval(Ctx { props: &props, facts: &facts, seen: None });
                     props[prop.0 as usize].set(a * (t_total * frequency).sin());
                     alive |= a.abs() > 0.01;
                     if timing && a.abs() > 0.01 {
@@ -3002,7 +3004,7 @@ pub fn run(
                     if op.reduced_motion {
                         continue;
                     }
-                    let v = per_second.eval(Ctx { props: &props, facts: &facts });
+                    let v = per_second.eval(Ctx { props: &props, facts: &facts, seen: None });
                     // Stopped, it lets the property be: a rule can send it
                     // somewhere. Pinning it every frame at speed 0 undid every
                     // `x: 0` —a reading clock that was never reset—.
@@ -3027,7 +3029,7 @@ pub fn run(
                     }
                 }
                 Behavior::Gaze { x, y, center, reach, distance, rest } => {
-                    let c = Ctx { props: &props, facts: &facts };
+                    let c = Ctx { props: &props, facts: &facts, seen: None };
                     let (mx, my) = match pointer {
                         Some((px, py)) => {
                             let (dx, dy) = (px - center.0.eval(c), py - center.1.eval(c));
@@ -3045,10 +3047,10 @@ pub fn run(
 
         // Postures: gestures that repeat on their own while something is true.
         if gesture.is_none() {
-            let c = Ctx { props: &props, facts: &facts };
+            let c = Ctx { props: &props, facts: &facts, seen: None };
             if let Some((g, _)) = scene.postures.iter().find(|(_, e)| e.is_true(c)) {
                 let k = g.0 as usize;
-                gesture = Some(Playback::start(k, &scene.gestures[k], &scene.pose, Ctx { props: &props, facts: &facts }, now, op.reduced_motion));
+                gesture = Some(Playback::start(k, &scene.gestures[k], &scene.pose, Ctx { props: &props, facts: &facts, seen: None }, now, op.reduced_motion));
             }
         }
 
@@ -3114,7 +3116,7 @@ pub fn run(
         // What is drawn exists if it falls on some live surface, or on some open
         // popup. A closed surface does not contribute its own: that way all of its things are discarded when
         // composing and its next frame comes out empty, which is what makes it disappear.
-        let open = |k: usize| scene.surfaces.get(k).and_then(|s| s.open.as_ref()).is_none_or(|e| e.is_true(Ctx { props: &props, facts: &facts }));
+        let open = |k: usize| scene.surfaces.get(k).and_then(|s| s.open.as_ref()).is_none_or(|e| e.is_true(Ctx { props: &props, facts: &facts, seen: None }));
         // The lock ones are not put up: they are engaged when their `open:` becomes
         // true and removed when it stops being so. When removing them, first what was
         // being painted on them is released and then them, like a popup.
@@ -3137,11 +3139,11 @@ pub fn run(
                 }
             }
         }
-        let open = |k: usize| scene.surfaces.get(k).and_then(|s| s.open.as_ref()).is_none_or(|e| e.is_true(Ctx { props: &props, facts: &facts }));
+        let open = |k: usize| scene.surfaces.get(k).and_then(|s| s.open.as_ref()).is_none_or(|e| e.is_true(Ctx { props: &props, facts: &facts, seen: None }));
         draw.views.clear();
         draw.views.extend(sheets.iter().filter(|l| open(l.view.surface)).map(|l| l.view.bounds()));
         for (k, em) in scene.popups.iter().enumerate() {
-            let c = Ctx { props: &props, facts: &facts };
+            let c = Ctx { props: &props, facts: &facts, seen: None };
             let wants = (facts[em.open.0 as usize] > 0.5 && !sheets.is_empty()).then(|| {
                 [em.at.0.eval(c).round() as i32, em.at.1.eval(c).round() as i32, em.size.0.eval(c).round().max(1.0) as i32, em.size.1.eval(c).round().max(1.0) as i32]
             });
@@ -3190,7 +3192,7 @@ pub fn run(
         }
         // ── 3. paint ────────────────────────────────────────────
         let blocked = logic_blocked.load(Ordering::Relaxed);
-        let c = Ctx { props: &props, facts: &facts };
+        let c = Ctx { props: &props, facts: &facts, seen: None };
         // Text and images are painted at the scale of the finest sheet; the
         // others see them reduced, which shows much less than enlarged.
         let finest = sheets.iter().map(|l| l.scale).fold(1.0f32, f32::max);
@@ -3382,14 +3384,35 @@ pub fn run(
         // in its box, which is a texture and not the list—: the list is the one
         // already made, and already on the card. A browser at 165 frames a second
         // made it again every time for nothing.
+        //
+        // And of the facts and properties, only the ones the drawing read when
+        // it was made: what it did not read cannot change it. The mouse going
+        // over a desktop that draws nothing of it —no dock under it, nothing
+        // carried— made the whole list again at the monitor's pace, to get the
+        // same list.
         let same_scene = !draw.timed
             && !draw.particles_alive
             && draw.wake_at.is_none()
+            && !draw.collect_texts
+            && warning.is_none()
             && compose_memo.as_ref().is_some_and(|m: &ComposeMemo| {
-                m.size == size && m.view == view && m.views == draw.views && m.facts == facts && m.texts == texts && m.window_tex == draw.window_tex && m.props.len() == props.len() && m.props.iter().zip(&props).all(|(a, b)| *a == b.x)
+                m.size == size
+                    && m.view == view
+                    && m.views == draw.views
+                    && m.texts == texts
+                    && m.window_tex == draw.window_tex
+                    && m.skip == draw.skip
+                    && m.order == draw.order
+                    && m.selected == draw.selected
+                    && m.signal_times == draw.signal_times
+                    && m.facts.len() == facts.len()
+                    && m.props.len() == props.len()
+                    && m.seen.facts().all(|k| m.facts[k] == facts[k])
+                    && m.seen.props().all(|k| m.props[k] == (props[k].x, props[k].v))
             });
         if !same_scene {
-            draw.compose(to_paint, c, &texts, &mut letters, view, size, op.hud);
+            compose_seen.reset(facts.len(), props.len());
+            draw.compose(to_paint, Ctx { seen: Some(&compose_seen), ..c }, &texts, &mut letters, view, size, op.hud);
             if draw.collect_texts {
                 let gone = |at: usize| draw.hidden.get(at).copied().unwrap_or(false) || absent.iter().any(|r| r.contains(&at));
                 let sight = crate::agent::Sight {
@@ -3420,7 +3443,20 @@ pub fn run(
                 draw.collect_texts = false;
                 draw.texts_seen.clear();
             }
-            compose_memo = Some(ComposeMemo { size, view, views: draw.views.clone(), facts: facts.clone(), texts: texts.clone(), window_tex: draw.window_tex.clone(), props: props.iter().map(|a| a.x).collect() });
+            compose_memo = Some(ComposeMemo {
+                size,
+                view,
+                views: draw.views.clone(),
+                facts: facts.clone(),
+                texts: texts.clone(),
+                window_tex: draw.window_tex.clone(),
+                props: props.iter().map(|a| (a.x, a.v)).collect(),
+                seen: compose_seen.clone(),
+                skip: draw.skip.clone(),
+                order: draw.order.clone(),
+                selected: draw.selected,
+                signal_times: draw.signal_times.clone(),
+            });
         }
         // An agent's action: when its steps are done and the scene has stopped
         // answering —its rules, its logic—, it is told what happened.
@@ -3742,7 +3778,7 @@ pub fn run(
         }
         for (k, sup) in scene.surfaces.iter().enumerate() {
             let Some((raised, when)) = &sup.level_while else { continue };
-            let wants = if when.is_true(Ctx { props: &props, facts: &facts }) { *raised } else { sup.level };
+            let wants = if when.is_true(Ctx { props: &props, facts: &facts, seen: None }) { *raised } else { sup.level };
             if levels_set[k] != wants {
                 levels_set[k] = wants;
                 crate::platform::relayer(k, wants);
@@ -3756,7 +3792,7 @@ pub fn run(
             let Some(when) = &sup.reserve_while else { continue };
             // A copy that is closed (`open:`) keeps none: Marea lives on one
             // monitor, and the other's copy left an empty strip there.
-            let c = Ctx { props: &props, facts: &facts };
+            let c = Ctx { props: &props, facts: &facts, seen: None };
             let open_here = sup.open.as_ref().is_none_or(|e| e.is_true(c));
             let wants = if when.is_true(c) && open_here { sup.exclusive_zone } else { 0 };
             if reserves_set[k] != wants {
@@ -4670,12 +4706,22 @@ fn thread_cpu_ms() -> f64 {
 /// is not what it was when it was last worked out. A scene of windows has
 /// hundreds, and a terminal's frame, which changes none of them, had them all
 /// worked out again.
+///
+/// What it reads is what it read the last time it was worked out, not all it
+/// names: `if(dock.up, … mouse.x …, 0)` with no dock up reads nothing of the
+/// mouse, and the mouse moving leaves it alone. By what they name, a desktop's
+/// 266 follows that name the mouse were all worked out again on every move
+/// of it, for the same values.
 #[derive(Default)]
 struct Follows {
     /// Which scene they belong to: another one, and all of it is forgotten.
     of: usize,
-    /// For each: the facts and properties it reads, what they were, and what it came to.
+    /// For each: the facts and properties it read, what they were, and what it came to.
     each: Vec<Option<Remembered>>,
+    /// Where what one reads is noted while it is worked out, and for how many
+    /// facts and properties it has room.
+    reading: crate::scene::Seen,
+    room: (usize, usize),
 }
 
 struct Remembered {
@@ -4693,11 +4739,7 @@ impl Follows {
             self.each = behaviors
                 .iter()
                 .map(|b| match b {
-                    Behavior::Follow { to, .. } | Behavior::Bind { to, .. } => {
-                        let (mut props, mut facts) = (Vec::new(), Vec::new());
-                        to.inputs(&mut props, &mut facts);
-                        Some(Remembered { facts, props, seen: Vec::new(), value: None })
-                    }
+                    Behavior::Follow { .. } | Behavior::Bind { .. } => Some(Remembered { facts: Vec::new(), props: Vec::new(), seen: Vec::new(), value: None }),
                     _ => None,
                 })
                 .collect();
@@ -4705,16 +4747,21 @@ impl Follows {
     }
 
     fn value(&mut self, k: usize, to: &Expr, props: &[Animated], facts: &[f32]) -> f32 {
-        let Some(r) = self.each.get_mut(k).and_then(Option::as_mut) else { return to.eval(Ctx { props, facts }) };
+        let Some(r) = self.each.get_mut(k).and_then(Option::as_mut) else { return to.eval(Ctx { props, facts, seen: None }) };
         let now = r.facts.iter().map(|h| facts[*h as usize]).chain(r.props.iter().flat_map(|p| [props[*p as usize].x, props[*p as usize].v]));
         if let Some(v) = r.value {
             if now.clone().eq(r.seen.iter().copied()) {
                 return v;
             }
         }
+        if self.room != (facts.len(), props.len()) {
+            self.room = (facts.len(), props.len());
+            self.reading.reset(facts.len(), props.len());
+        }
+        let v = to.eval(Ctx { props, facts, seen: Some(&self.reading) });
+        self.reading.take(&mut r.facts, &mut r.props);
         r.seen.clear();
-        r.seen.extend(now);
-        let v = to.eval(Ctx { props, facts });
+        r.seen.extend(r.facts.iter().map(|h| facts[*h as usize]).chain(r.props.iter().flat_map(|p| [props[*p as usize].x, props[*p as usize].v])));
         r.value = Some(v);
         v
     }
@@ -4727,10 +4774,47 @@ struct ComposeMemo {
     /// What falls on no sheet is left out of the list: a sheet that comes
     /// (a lock screen, after its `open:` had already been read) makes it again.
     views: Vec<[f32; 4]>,
+    /// The facts, and each property's value and speed, as they were; and
+    /// which of them the drawing read: only those have to hold.
     facts: Vec<f32>,
+    props: Vec<(f32, f32)>,
+    seen: crate::scene::Seen,
     texts: Vec<String>,
     window_tex: Vec<Option<crate::gpu::WindowTex>>,
-    props: Vec<f32>,
+    /// What else the list is made from: the parts asleep, the order of what
+    /// has a `z:`, the text selected, and when each event last happened.
+    skip: Vec<std::ops::Range<usize>>,
+    order: Option<Vec<usize>>,
+    selected: Option<(usize, usize, usize)>,
+    signal_times: Vec<f32>,
+}
+
+#[cfg(test)]
+mod follows_tests {
+    use super::*;
+    use crate::scene::{FactId, PropId, Spring};
+
+    #[test]
+    fn a_follow_is_worked_out_again_only_for_what_it_read() {
+        // follow p = if(fact 0, fact 1, 7): the dock's place under the mouse, with no dock up.
+        let to = Expr::Mix(Box::new(Expr::K(7.0)), Box::new(Expr::H(FactId(1))), Box::new(Expr::H(FactId(0))));
+        let behaviors = vec![Behavior::Follow { prop: PropId(0), to: to.clone() }];
+        let props = vec![Animated::at(0.0, Spring::LIVELY)];
+        let mut follows = Follows::default();
+        follows.begin(&behaviors);
+        assert_eq!(follows.value(0, &to, &props, &[0.0, 5.0]), 7.0);
+        let read = |f: &Follows| f.each[0].as_ref().unwrap().facts.clone();
+        assert_eq!(read(&follows), [0]);
+        // The mouse moves (fact 1): not read, so it is not worked out again…
+        follows.each[0].as_mut().unwrap().value = Some(-1.0);
+        assert_eq!(follows.value(0, &to, &props, &[0.0, 9.0]), -1.0);
+        // …until the dock is up (fact 0), and then it reads the mouse and follows it.
+        assert_eq!(follows.value(0, &to, &props, &[1.0, 9.0]), 9.0);
+        assert_eq!(read(&follows), [0, 1]);
+        assert_eq!(follows.value(0, &to, &props, &[1.0, 12.0]), 12.0);
+        assert_eq!(follows.value(0, &to, &props, &[0.0, 12.0]), 7.0);
+        assert_eq!(read(&follows), [0]);
+    }
 }
 
 #[cfg(test)]

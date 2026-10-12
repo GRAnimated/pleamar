@@ -208,6 +208,72 @@ pub struct ImageId(pub u16);
 pub struct Ctx<'a> {
     pub props: &'a [Animated],
     pub facts: &'a [f32],
+    /// Where to note what is read, for whoever wants to know what a result
+    /// was made from (see `Seen`); `None`, nobody.
+    pub seen: Option<&'a Seen>,
+}
+
+/// Which facts and properties were read while something was worked out: a
+/// bit each. A result made only from those holds for as long as they do,
+/// whatever else changes —a drawing that reads nothing of the mouse is the
+/// same drawing wherever the mouse is—.
+#[derive(Default, Clone)]
+pub struct Seen {
+    facts: Vec<std::cell::Cell<u64>>,
+    props: Vec<std::cell::Cell<u64>>,
+}
+
+impl Seen {
+    /// Nothing read yet, with room for that many of each.
+    pub fn reset(&mut self, facts: usize, props: usize) {
+        self.facts.clear();
+        self.facts.resize(facts.div_ceil(64), std::cell::Cell::new(0));
+        self.props.clear();
+        self.props.resize(props.div_ceil(64), std::cell::Cell::new(0));
+    }
+    #[inline]
+    pub fn fact(&self, k: usize) {
+        if let Some(w) = self.facts.get(k >> 6) {
+            w.set(w.get() | 1 << (k & 63));
+        }
+    }
+    #[inline]
+    pub fn prop(&self, k: usize) {
+        if let Some(w) = self.props.get(k >> 6) {
+            w.set(w.get() | 1 << (k & 63));
+        }
+    }
+    fn each(words: &[std::cell::Cell<u64>]) -> impl Iterator<Item = usize> + '_ {
+        words.iter().enumerate().flat_map(|(w, bits)| {
+            let mut left = bits.get();
+            std::iter::from_fn(move || {
+                (left != 0).then(|| {
+                    let k = left.trailing_zeros() as usize;
+                    left &= left - 1;
+                    w * 64 + k
+                })
+            })
+        })
+    }
+    /// What was read, into those lists, and nothing read again: for whoever
+    /// keeps one of these for many evaluations, one after another.
+    pub fn take(&self, facts: &mut Vec<u16>, props: &mut Vec<u16>) {
+        facts.clear();
+        facts.extend(Seen::each(&self.facts).map(|k| k as u16));
+        props.clear();
+        props.extend(Seen::each(&self.props).map(|k| k as u16));
+        for w in self.facts.iter().chain(&self.props) {
+            w.set(0);
+        }
+    }
+    /// The facts read, by their index.
+    pub fn facts(&self) -> impl Iterator<Item = usize> + '_ {
+        Seen::each(&self.facts)
+    }
+    /// The properties read, by their index.
+    pub fn props(&self) -> impl Iterator<Item = usize> + '_ {
+        Seen::each(&self.props)
+    }
 }
 
 /// A pure expression over the properties. Since it has no side effects, the render
@@ -417,9 +483,24 @@ impl Expr {
         use Expr::*;
         match self {
             K(v) => *v,
-            P(p) => c.props[p.0 as usize].x,
-            H(h) => c.facts[h.0 as usize],
-            Vel(p) => c.props[p.0 as usize].v,
+            P(p) => {
+                if let Some(s) = c.seen {
+                    s.prop(p.0 as usize);
+                }
+                c.props[p.0 as usize].x
+            }
+            H(h) => {
+                if let Some(s) = c.seen {
+                    s.fact(h.0 as usize);
+                }
+                c.facts[h.0 as usize]
+            }
+            Vel(p) => {
+                if let Some(s) = c.seen {
+                    s.prop(p.0 as usize);
+                }
+                c.props[p.0 as usize].v
+            }
             Add(a, b) => a.eval(c) + b.eval(c),
             Sub(a, b) => a.eval(c) - b.eval(c),
             Mul(a, b) => a.eval(c) * b.eval(c),
@@ -507,7 +588,7 @@ impl Expr {
             },
         };
         if constant_children {
-            return K(self.eval(Ctx { props: &[], facts: &[] }));
+            return K(self.eval(Ctx { props: &[], facts: &[], seen: None }));
         }
         match self {
             Add(a, b) if k(&b) == Some(0.0) => *a,
@@ -2460,6 +2541,32 @@ mod tests {
     }
 
     #[test]
+    fn what_an_evaluation_reads_is_only_what_it_reached() {
+        // if(fact 0, fact 1 + prop 0, 7): with fact 0 false, nothing else is read.
+        let e = Expr::Mix(Box::new(Expr::K(7.0)), Box::new(Expr::Add(Box::new(Expr::H(FactId(1))), Box::new(Expr::P(PropId(0))))), Box::new(Expr::H(FactId(0))));
+        let props = animated(&[3.0]);
+        let mut seen = Seen::default();
+        seen.reset(70, 1);
+        assert_eq!(e.eval(Ctx { props: &props, facts: &[0.0, 5.0], seen: Some(&seen) }), 7.0);
+        assert_eq!(seen.facts().collect::<Vec<_>>(), [0]);
+        assert_eq!(seen.props().count(), 0);
+        // True, it reads the rest; and taking them leaves it clean for the next.
+        assert_eq!(e.eval(Ctx { props: &props, facts: &[1.0, 5.0], seen: Some(&seen) }), 8.0);
+        let (mut facts, mut read_props) = (Vec::new(), Vec::new());
+        seen.take(&mut facts, &mut read_props);
+        assert_eq!((facts, read_props), (vec![0, 1], vec![0]));
+        assert_eq!(seen.facts().count() + seen.props().count(), 0);
+        // A condition stops at its first false side; a fact past the first word is noted too.
+        let both = Expr::And(Box::new(Expr::H(FactId(0))), Box::new(Expr::H(FactId(65))));
+        let mut facts = [0.0; 70];
+        both.eval(Ctx { props: &props, facts: &facts, seen: Some(&seen) });
+        assert_eq!(seen.facts().collect::<Vec<_>>(), [0]);
+        facts[0] = 1.0;
+        both.eval(Ctx { props: &props, facts: &facts, seen: Some(&seen) });
+        assert_eq!(seen.facts().collect::<Vec<_>>(), [0, 65]);
+    }
+
+    #[test]
     fn constants_fold_on_read() {
         assert!(matches!((Expr::K(2.0) * 3.0 + 1.0), Expr::K(7.0)));
         assert!(matches!(Expr::K(0.0) - Expr::K(4.0), Expr::K(-4.0)));
@@ -2472,7 +2579,7 @@ mod tests {
     #[test]
     fn mix_matches_lerp() {
         let props = animated(&[0.25, 1.0, 0.0]);
-        let c = Ctx { props: &props, facts: &[] };
+        let c = Ctx { props: &props, facts: &[], seen: None };
         let (a, b) = (Expr::K(10.0), Expr::K(20.0));
         for p in 0..3 {
             let t = props[p].x;

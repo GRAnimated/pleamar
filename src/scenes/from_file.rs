@@ -320,7 +320,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mut facts: Vec<f32> = scene.facts.iter().map(|f| f.1).collect();
         let count = scene.facts.iter().position(|f| f.0 == "rows.count").expect("rows.count");
-        let active = |facts: &[f32]| scene.zones.iter().filter(|z| z.active.is_true(crate::scene::Ctx { props: &[], facts })).count();
+        let active = |facts: &[f32]| scene.zones.iter().filter(|z| z.active.is_true(crate::scene::Ctx { props: &[], facts, seen: None })).count();
         assert_eq!(scene.zones.len(), 4);
         facts[count] = 4.0;
         assert_eq!(active(&facts), 4);
