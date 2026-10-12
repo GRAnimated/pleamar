@@ -2964,6 +2964,12 @@ pub fn run(
                     if v.abs() < 1e-9 {
                         continue;
                     }
+                    // The clock only shaders read stands still while none of
+                    // them is drawn: rain that is not falling kept a desktop
+                    // going round at the monitor's pace, all day, for nothing.
+                    if scene.shader_clock == Some(*prop) && !draw.timed {
+                        continue;
+                    }
                     // Turning, it carries the property and where it is going
                     // together: a rule that sends it back to 0 midway is obeyed,
                     // and it goes on turning from there.
@@ -3419,6 +3425,11 @@ pub fn run(
         }
         // Particles carry themselves: while one is alive, the scene does not rest.
         alive |= draw.particles_alive;
+        // A shader that reads the clock has just been drawn: the clock goes
+        // on from the next round (see `shader_clock`).
+        if draw.timed && scene.shader_clock.is_some() {
+            alive = true;
+        }
         // An image that moves: wake up when it changes frame.
         if let Some(t) = draw.wake_at {
             appointments.push(start + Duration::from_secs_f32(t.max(t_total + 0.001)));

@@ -419,6 +419,8 @@ pub fn compile<'a>(tree: &'a [Entry], files: &'a [String], dirs: &'a [std::path:
     // be able to sleep. Like `spin`, it stops with reduced motion.
     if mentions(body, "time") && !declares(body, "time") {
         o.time_prop();
+        // Named: it goes whether or not anything drawn reads it.
+        o.e.shader_clock = None;
     }
     o.e.wants_cursor = mentions(body, "cursor") || mentions_part(body, "cursor");
     hover_mentions(body, &mut o.hover_mentions);
@@ -3771,6 +3773,7 @@ impl<'a> Compiler<'a> {
         }
         let p = self.e.prop("time", 0.0);
         self.props.insert("time".into(), p);
+        self.e.shader_clock = Some(p);
         self.e.behaviors.push(Behavior::Advance { prop: p, per_second: Expr::K(1.0) });
         p
     }

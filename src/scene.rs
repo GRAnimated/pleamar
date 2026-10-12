@@ -1749,6 +1749,9 @@ pub struct Scene {
     /// Whether it names `cursor.x` or `cursor.y`: only then is the system asked
     /// where the mouse is when it is not over the scene.
     pub wants_cursor: bool,
+    /// The scene's `time`, when only its shaders read it: it stands still
+    /// while none of them is drawn, so the scene can rest.
+    pub shader_clock: Option<PropId>,
 }
 
 #[derive(Clone, Debug, Default)]

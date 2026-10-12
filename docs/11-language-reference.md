@@ -819,7 +819,7 @@ What it receives, in `s`:
 | | |
 | --- | --- |
 | `s.pos` · `s.size` · `s.uv` | the point inside its box, in logical pixels from the top left corner; the size of the box; and the two divided (0 to 1) |
-| `s.time` | seconds since the scene started. **Only if it reads it** does the scene keep painting it: a shader that does not read `time` costs nothing while nothing changes |
+| `s.time` | seconds since the scene started. **Only if it reads it** does the scene keep painting it: a shader that does not read `time` costs nothing while nothing changes. And only **while it is drawn**: hidden (a `show:` that does not hold, an opacity of 0), the clock stands still and the scene rests, unless the scene itself names `time` |
 | `s.pointer` · `s.hovered` | where the mouse is, in the same coordinates as `s.pos`, and 1 while it is over the box. Only if it reads them is it painted again when the mouse moves |
 | `s.a` · `s.b` | the eight `values:`, four and four (`s.a.x` is the first) |
 | `s.color` · `s.color2` | the two `colors:` |
