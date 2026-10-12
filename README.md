@@ -114,6 +114,8 @@ Every release, with what changed: [Releases].
   in the scene and filled.
 - **Lock screens** on `ext-session-lock`, where the compositor guarantees nothing
   else is seen while it lasts.
+- **The password dialog**: a scene can be the session's polkit agent and draw it
+  itself, when a program wants root.
 - **Live reload**: save the file and it reloads without losing what was in motion;
   save it broken and the last good scene stays, with a band saying where.
 - **Its own compositor**: [pleamar-wm] runs other programs' windows inside a scene,

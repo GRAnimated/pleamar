@@ -137,6 +137,7 @@ pub const SERVICES: &[(&str, &[&str])] = &[
     ("tray", &["list"]),
     ("notifications", &["list"]),
     ("notification_history", &["list"]),
+    ("polkit", &["ready", "pending", "asking", "message", "action", "icon", "user", "prompt", "secret", "info", "error"]),
 ];
 
 /// The fields of a service that are lists: each one goes into a model, never into a fact.

@@ -126,6 +126,7 @@ fn start_service(from: &str, name: &str, notify: Box<dyn Fn(SysValue) + Send>) -
         "bluetooth" if bluez::available() => return bluez::service(notify),
         "media" => return mpris::service(notify),
         "notifications" => return notifications::service(notify),
+        "polkit" => return polkit::service(notify),
         "notification_history" => return notifications::history(notify),
         "tray" => return tray::service(notify),
         "thumbnails" => return thumbnails::service(notify),
@@ -171,6 +172,10 @@ pub fn command(from: &str, name: &str, args: &[SysValue]) -> Result<(), String> 
     #[cfg(target_os = "linux")]
     if name.starts_with("bluetooth.") {
         return bluez::command(name, args);
+    }
+    #[cfg(target_os = "linux")]
+    if name.starts_with("polkit.") {
+        return polkit::command(name, args);
     }
     #[cfg(target_os = "linux")]
     if name.starts_with("network.") {
@@ -908,6 +913,8 @@ pub fn gamepad(_: usize) -> Option<SysValue> {
 mod auth;
 #[cfg(target_os = "linux")]
 mod notifications;
+#[cfg(target_os = "linux")]
+mod polkit;
 #[cfg(target_os = "linux")]
 mod tray;
 #[cfg(target_os = "linux")]

@@ -1,0 +1,31 @@
+// expect: ok
+language 0.4
+// The password dialog, from what the polkit service says: a scene that
+// declares it is the session's agent while it runs. The logic carries the
+// answer (`sys.call("polkit.answer", …)`); what is seen needs none.
+scene Authority {
+    surface { size: 360, 150; anchor: center; keyboard: exclusive while auth.pending }
+    permissions { services: "polkit" }
+
+    service polkit as auth {
+        ready: bool
+        pending: bool
+        asking: bool
+        message: text
+        action: text
+        icon: text
+        user: text
+        prompt: text
+        secret: bool
+        info: text
+        error: none | wrong
+    }
+
+    text answer = ""
+    box { from: 0, 0; size: 360, 150; corner: 16; color: #151616; opacity: auth.pending }
+    text auth.message { at: 20, 18; width: 320; lines: 2; size: 13; color: #f5f7f5 }
+    text "{auth.prompt} {auth.user}" { at: 20, 70; anchor: left center; size: 12; color: #9ed6bd }
+    input answer { at: 20, 86; width: 320; size: 15; color: #f5f7f5; secret: true; agent: no }
+    text "That was not it" { at: 20, 128; anchor: left center; size: 12; color: #e8c07a; show: auth.error == wrong }
+    text "No other agent may ask here" { at: 340, 128; anchor: right center; size: 11; color: #f5f7f5; opacity: 40%; show: not auth.ready }
+}

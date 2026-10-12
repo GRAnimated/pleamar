@@ -331,6 +331,7 @@ What each service brings is in the vocabulary (§17), and **asking it for what i
 | `clock.time` · `clock.date` | already written out: `10:41`, `Sun 20 Sep` |
 | `audio.input` · `audio.input_muted` | the microphone: the same two, for what comes in |
 | `network.kind` | `none`, `wired` or `wifi` |
+| `polkit.error` | `none`, or `wrong` after an answer that was not it |
 | `network.error` | why the last attempt to join a network did not get in: `none` (it did, or none was made), `password` (wrong, or none given), `timeout`, `unsupported`, `busy` or `failed`. With iwd; with NetworkManager it stays `none`, and a network that was not joined is one that never turns `active` |
 | the `bool` ones | `muted`, `charging`, `present`, `online`, `playing` |
  Whatever does not come in a report stays as it was.
@@ -459,6 +460,8 @@ scene Lock {
 ```
 
 If whoever locks dies with the lock held, the session **stays locked**. That is on purpose —the opposite would mean killing the locker unlocks— and it is the reason to try a lock screen inside a nested compositor first, never against a live session.
+
+**Asking for the password: the `polkit` service.** When a program wants to do something as root —mounting a disk, a system tool, `pkexec`— somebody has to ask whoever sits there for the password: the session's *authentication agent*. A scene that declares `service polkit` **is** that agent while it runs, and draws the dialog itself. `polkit.ready` says it got to be it (there is one per session: with another program's already there, it stays false); `polkit.pending`, that a program is waiting to be let through, and then `message` is what polkit says is wanted, `action` its name and `user` whose password it takes; `polkit.asking`, that an answer is awaited —not while the last one is being checked—, with `prompt` what is asked («Password: ») and `secret` whether to hide what is typed; `info`, what the system says meanwhile (a finger on the reader); `polkit.error`, `none` or `wrong` after an answer that was not it, which is asked again, three times at most. The answer is the logic's to carry: `sys.call("polkit.answer", text.answer)` and `sys.call("polkit.cancel")`, with `services: "polkit.*"`. **The scene is the messenger**: the answer goes to polkit's own helper, which asks the system and tells polkit; pleamar never learns whether it was right other than by being told, and gains no privilege. Mark the field and the button that lets a program through `agent: no`: that is for a person to do. The whole dialog is in `examples/password.plm`.
 
 ## 7. Expressions
 
@@ -1532,7 +1535,7 @@ fact_types: number bool
 model: list
 path: move line curve close
 documented: translations surface permissions model service spring prop pose fact event text image figure particles shader measure let zone body ellipse box arc line path input clip group popup component children repeat for row grid windows window pages column space between layer on every blink wave spin follow look gesture posture import scene library include part language
-services: clock clock.seconds audio battery brightness network bluetooth media window thumbnails workspaces apps tray notifications notification_history
+services: clock clock.seconds audio battery brightness network bluetooth media window thumbnails workspaces apps tray notifications notification_history polkit
 services.clock: hour minute second day month year weekday time date
 services.clock.seconds: hour minute second day month year weekday time date
 services.audio: volume muted input input_muted outputs inputs apps
@@ -1548,6 +1551,7 @@ services.apps: list
 services.tray: list
 services.notifications: list
 services.notification_history: list
+services.polkit: ready pending asking message action icon user prompt secret info error
 parameter_types: number bool color text record event image gesture spring
 springs: lively calm quick slow gentle pose
 units: px % deg ms s
