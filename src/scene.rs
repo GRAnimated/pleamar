@@ -2230,7 +2230,7 @@ pub enum DockAction {
 }
 
 /// How many items a monitor's dock has at most.
-pub const DOCK_ITEMS: usize = 12;
+pub const DOCK_ITEMS: usize = 20;
 
 /// What the compositor inside the scene tells the render.
 pub enum NestEvent {
