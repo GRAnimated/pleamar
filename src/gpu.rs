@@ -712,8 +712,11 @@ impl DrawList {
         let inside_x = (shape[2].min(w) - shape[0].max(0.0)).max(0.0) / size_x;
         let inside_y = (shape[3].min(height) - shape[1].max(0.0)).max(0.0) / size_y;
         let almost = [inside_x, inside_y, inside_x, inside_y];
+        //  And only what is seen at all: what a scene parks far below its
+        //  surface is not cut on the right, however far its side reaches.
+        let across = [inside_y, inside_x, inside_y, inside_x];
         let sides = ["on the left", "above", "on the right", "below"];
-        let counts = |k: usize| !self.attached_edges[k] && missing[k] > 0.5 && almost[k] >= 0.75;
+        let counts = |k: usize| !self.attached_edges[k] && missing[k] > 0.5 && almost[k] >= 0.75 && across[k] > 0.0;
         let told: Vec<String> = (0..4).filter(|&k| counts(k)).map(|k| format!("{:.0} px {}", missing[k].ceil(), sides[k])).collect();
         if told.is_empty() {
             return;
