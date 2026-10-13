@@ -2140,6 +2140,13 @@ pub enum ToRender {
     AgentButton(u8, bool),
     /// Wheel notches: positive, upwards.
     Wheel(f32),
+    /// Fingers moving what is under the pointer (a touchpad's two, one on a
+    /// phone's glass): `x`, `y`, how far it goes, in units, for a window
+    /// (down and to the right, positive: as Wayland says it), and the
+    /// `notches` that is worth to the scene's own zones.
+    Scroll { x: f32, y: f32, notches: f32 },
+    /// The fingers were lifted.
+    ScrollEnd,
     /// Nothing happened, but a round is wanted: the logic has started to
     /// listen to every frame, and a render at rest would not tell it of any.
     Wake,
@@ -2374,6 +2381,10 @@ pub enum ToNest {
     /// evdev codes: 0x110 left, 0x111 right, 0x112 middle.
     Button { code: u32, down: bool },
     Wheel(f64),
+    /// Fingers moving what is under the pointer, in the window's own pixels:
+    /// down and to the right, positive. And the fingers lifted.
+    Scroll(f64, f64),
+    ScrollEnd,
     /// An evdev key code.
     Key { code: u32, down: bool },
     /// Whether pleamar's own window has the keyboard.

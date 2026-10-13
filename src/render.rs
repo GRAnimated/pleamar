@@ -638,6 +638,10 @@ pub fn run(
         // Which of them come from an agent's own seat.
         let mut buttons_agent: Vec<bool> = Vec::new();
         let mut wheel = 0.0f32;
+        // What fingers moved (not a wheel): for a window as it is, already
+        // counted in `wheel` as notches for the zones.
+        let mut fingers = (0.0f32, 0.0f32, 0.0f32);
+        let mut fingers_up = false;
         let mut keys: Vec<String> = Vec::new();
         let mut key_presses: Vec<(String, Option<String>, Mods, u32)> = Vec::new();
         let mut key_releases: Vec<(String, u32)> = Vec::new();
@@ -1224,6 +1228,12 @@ pub fn run(
                     wheel += d;
                     last_activity = Instant::now();
                 }
+                ToRender::Scroll { x, y, notches } => {
+                    wheel += notches;
+                    fingers = (fingers.0 + x, fingers.1 + y, fingers.2 + notches);
+                    last_activity = Instant::now();
+                }
+                ToRender::ScrollEnd => fingers_up = true,
                 ToRender::Wake | ToRender::FrameSeen => {}
                 ToRender::KeyRepeat(r) => key_repeat = r,
                 ToRender::Key(name, typed, mods, code) => {
@@ -2173,10 +2183,16 @@ pub fn run(
             // that is where it would be dropped.
             let hovered_window = hovered.and_then(|k| nest_zones.get(k).copied().flatten());
             let under = if nest_dragging { hovered_window } else { nest_grab.or(hovered_window) };
+            // (And how many of its own pixels a unit of the scene is there: a
+            // window drawn small moves further under the same fingers.)
+            let mut local_scale = (1.0f32, 1.0f32);
             let local = under.zip(pointer).and_then(|(slot, (x, y))| {
                 let (_, d, affine) = draw.windows_drawn.iter().rev().find(|w| w.0 == slot)?;
                 let g = nest_windows.get(slot)?.geometry;
                 let (lx, ly) = affine.inverse().apply(x, y);
+                if d[2] > 0.0 && d[3] > 0.0 && g[2] > 0 && g[3] > 0 {
+                    local_scale = (g[2] as f32 / d[2], g[3] as f32 / d[3]);
+                }
                 Some((slot, ((lx - d[0]) / d[2] * g[2] as f32) as f64, ((ly - d[1]) / d[3] * g[3] as f32) as f64))
             });
             match local {
@@ -2213,8 +2229,18 @@ pub fn run(
                     }
                 }
             }
-            if wheel != 0.0 && local.is_some() {
-                send(ToNest::Wheel(wheel as f64));
+            // The wheel in notches; what fingers moved, as far as they went.
+            if local.is_some() {
+                let turned = wheel - fingers.2;
+                if turned.abs() > 1e-6 {
+                    send(ToNest::Wheel(turned as f64));
+                }
+                if fingers.0 != 0.0 || fingers.1 != 0.0 {
+                    send(ToNest::Scroll((fingers.0 * local_scale.0) as f64, (fingers.1 * local_scale.1) as f64));
+                }
+            }
+            if fingers_up {
+                send(ToNest::ScrollEnd);
             }
         }
 
