@@ -1,0 +1,11 @@
+// expect: error «and no more than 65536 fit»
+language 0.1
+// A property is named with sixteen bits: the scene that needs more is told so, not left to move the wrong ones.
+scene TooMany {
+    surface { size: 200, 100 }
+    repeat i in 0..512 {
+        repeat j in 0..130 {
+            prop p.$i.$j = 0
+        }
+    }
+}

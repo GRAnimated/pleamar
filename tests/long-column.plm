@@ -1,0 +1,21 @@
+// expect: ok
+language 0.1
+// Two hundred rows in a column. Where each one falls is the sum of the ones
+// before, and how far in, the breadth of the fattest: written out in each row and
+// in each of its zones that was two hundred times two hundred. Each partial sum
+// is computed once per frame, and so is a colour that chooses among several.
+scene LongColumn {
+    surface { size: 400, 600 }
+    fact kind = 0
+    fact shown = 100
+    let tint = mix(mix(mix(mix(#9ed6bd, #e8c07a, kind == 1), #e86a9a, kind == 2), #6fb1e6, kind == 3), #f5f7f5, kind == 4)
+    column list { at: 10, 10; gap: 2; align: center
+        repeat k in 0..200 {
+            group { size: 100 + mod(k, 7) * 20, 10 + mod(k, 3) * 4; show: k < shown
+                zone box line { from: 0, 0; size: 100 + mod(k, 7) * 20, 10 + mod(k, 3) * 4 }
+                box { from: 0, 0; size: 100 + mod(k, 7) * 20, 10 + mod(k, 3) * 4; color: tint }
+                on press line { shown = k }
+            }
+        }
+    }
+}

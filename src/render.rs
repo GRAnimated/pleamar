@@ -3136,6 +3136,30 @@ pub fn run(
             gesture = None;
         }
 
+        // What is bound is computed again now that the springs have moved. Read
+        // only before them, a sum kept in a property —a big `let`, where the
+        // children of a layout fall— went one frame behind what the drawing
+        // reads straight: a row that grows, and the one under it a frame late.
+        // What it reads has seldom changed, and then it is only looked at. One
+        // that did change asks for another round: whatever follows it, or is
+        // decided by it, read the old one above.
+        for (k, behavior) in scene.behaviors.iter().enumerate() {
+            if let Behavior::Bind { prop, to } = behavior {
+                if absent_behaviors.iter().any(|r| r.contains(&k)) {
+                    continue;
+                }
+                let v = follows.value(k, to, &props, &facts);
+                let p = &mut props[prop.0 as usize];
+                if (p.x - v).abs() > 1e-3 {
+                    alive = true;
+                    if timing {
+                        alive_by.push(format!("{} bound to what moved", scene.props[prop.0 as usize].0));
+                    }
+                }
+                p.set(v);
+            }
+        }
+
         // The popups: open while their fact is true, where and how their expressions
         // say. If they change place or size while open, they are remade.
         popups.resize(scene.popups.len(), None);

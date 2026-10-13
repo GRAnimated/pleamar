@@ -430,6 +430,36 @@ mod tests {
     }
 
     #[test]
+    fn where_the_rows_of_a_long_column_fall_is_computed_once() {
+        let (scene, _) = super::read_file(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/long-column.plm")).unwrap();
+        let lines: Vec<&crate::scene::Zone> = scene.zones.iter().filter(|z| z.id.starts_with("line#")).collect();
+        assert_eq!(lines.len(), 200);
+        // What a zone carries of where it is does not grow with the rows before it.
+        for z in &lines {
+            let nodes: usize = z.under.iter().map(|t| [&t.pivot.0, &t.pivot.1, &t.rotate, &t.scale.0, &t.scale.1, &t.translate.0, &t.translate.1].iter().map(|e| e.node_count()).sum::<usize>()).sum();
+            assert!(nodes < 60, "{} carries {nodes} nodes of where it is", z.id);
+        }
+        // Nor does what it is painted with: the colour is three properties.
+        let painted: Vec<usize> = scene.instrs.iter().filter_map(|i| if let crate::scene::Instr::Solid { color, .. } = i { Some(color.iter().map(Expr::node_count).sum()) } else { None }).collect();
+        assert_eq!(painted.len(), 200);
+        assert!(painted.iter().all(|n| *n == 3), "each box reads its colour from three properties");
+        // And each row is where it was: under the ones before it, centred on the fattest one that is there.
+        let facts: Vec<f32> = scene.facts.iter().map(|(_, v)| *v).collect();
+        let props = settled(&scene, &facts);
+        let c = Ctx { props: &props, facts: &facts, seen: None };
+        let width = |k: usize| 100.0 + (k % 7) as f32 * 20.0;
+        let height = |k: usize| 10.0 + (k % 3) as f32 * 4.0;
+        let mut top = 0.0;
+        for k in 0..100 {
+            let z = lines.iter().find(|z| z.id == format!("line#k{k}")).unwrap();
+            let slot = z.under.last().unwrap();
+            let (x, y) = (slot.translate.0.eval(c), slot.translate.1.eval(c));
+            assert!((y - top).abs() < 1e-2 && (x - (220.0 - width(k)) * 0.5).abs() < 1e-2, "row {k} is at {x}, {y} and it had to be at {}, {top}", (220.0 - width(k)) * 0.5);
+            top += height(k) + 2.0;
+        }
+    }
+
+    #[test]
     fn a_chain_of_lets_from_the_screen_is_computed_once_per_copy() {
         let (scene, _) = super::read_file(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/chained-lets-per-screen.plm")).unwrap();
         // Each link names the previous one twice: substituted, the last one was

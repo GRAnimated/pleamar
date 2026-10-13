@@ -654,6 +654,13 @@ pub fn compile<'a>(tree: &'a [Entry], files: &'a [String], dirs: &'a [std::path:
     symbols.extend(o.used.take().into_iter().filter(|s| seen_places.insert((s.local.clone(), s.line, s.col))));
     crate::scene::settle_effects(&mut o.e.instrs);
     o.note_loose_clips(body);
+    // A property and a fact are named with sixteen bits: one more than fit
+    // would be taken for the first, and the scene would move what it should not.
+    for (what, n) in [("properties", o.e.props.len()), ("facts", o.e.facts.len())] {
+        if n > u16::MAX as usize + 1 {
+            o.errors.push(CompileError::at(1, 1, format!("this scene has {n} {what}, and no more than 65536 fit: the ones it declares and the ones made for it (a spring per zone that is hovered, a slot per child of a layout, a big `let`). Fewer copies in its `repeat`s and `for`s, or a list that lays out only its window (`view:`, `content:`, `for … from`)")));
+        }
+    }
     (if o.errors.is_empty() { Ok(o.e) } else { Err(o.errors) }, symbols)
 }
 
@@ -2069,6 +2076,13 @@ impl<'a> Compiler<'a> {
                     if is_color {
                         let k = self.color(&mut c)?;
                         c.expect_end()?;
+                        // A colour with a name is substituted where it is named too, and one
+                        // that chooses among many —a theme's, a category's— is a tree per
+                        // channel in every shape painted with it. Big, each channel is
+                        // computed once per frame, like any other `let`. (Not one that is
+                        // each monitor's copy's own: that one stays as it is written.)
+                        let own_per_copy = self.scopes.is_empty() && k.iter().any(|e| self.is_per_copy(e));
+                        let k = if own_per_copy { k } else { k.map(|e| self.shared(&name, e)) };
                         match self.scopes.last_mut().map(Rc::make_mut) {
                             Some(e) => e.colors.insert(name, k),
                             None => self.colors.insert(name, k),
@@ -4093,6 +4107,15 @@ impl<'a> Compiler<'a> {
         p
     }
 
+    /// What several children of a layout read —how far along the ones before
+    /// reach, the breadth of the fattest, how many are there—: big, it is
+    /// computed once per frame in a property, and each child reads that. Written
+    /// out in each of them, and in each of their zones, a list of *n* rows was
+    /// *n²* nodes.
+    fn shared(&mut self, what: &str, e: Expr) -> Expr {
+        if e.node_count() > 8 { self.computed_once(what, e).e() } else { e }
+    }
+
     /// Whether a loose `let` is worth something different in each monitor's
     /// copy: it reads `screen.*`, or another `let` that does and is computed
     /// in a property per copy.
@@ -4807,7 +4830,9 @@ impl<'a> Compiler<'a> {
         // The children come out of a queue: after each one (except the first) its separator slips in,
         // which is seen if that child is there and some of the earlier ones too.
         let mut queue: std::collections::VecDeque<(&'a Node, Vec<Rc<Scope>>, Option<Expr>)> = children.into_iter().map(|(h, e)| (h, e, None)).collect();
-        let mut presences: Vec<Expr> = Vec::new();
+        // How many of the children read so far are there, and how many were read.
+        let mut present_so_far: Option<Expr> = None;
+        let mut children_read = 0usize;
         while let Some((child, scopes, forced)) = queue.pop_front() {
             let mark = self.rules.len();
             // A child that comes from outside the component is read with the scope of whoever wrote it.
@@ -4923,22 +4948,26 @@ impl<'a> Compiler<'a> {
                 Some(_) => placed_items.insert(placed_items.len() - 1, placed),
                 None => {
                     let presence = is_present.unwrap_or(Expr::K(1.0));
-                    if let (Some((sep, counter)), Some(before)) = (&separator, presences.iter().cloned().reduce(|a, b| a + b)) {
+                    if let (Some((sep, counter)), Some(before)) = (&separator, present_so_far.clone()) {
                         self.copies += 1;
                         let mut env = Scope { suffix: format!("#between{}", self.copies), ..Default::default() };
                         if let Some(v) = counter {
-                            env.exprs.insert(v.clone(), Expr::K(presences.len() as f32));
+                            env.exprs.insert(v.clone(), Expr::K(children_read as f32));
                         }
                         let sep = *sep;
                         queue.push_front((sep, vec![Rc::new(env)], Some(presence.clone() * before.min(Expr::K(1.0)))));
                     }
-                    presences.push(presence);
+                    present_so_far = Some(match present_so_far.take() {
+                        Some(before) => self.shared("count", before + presence),
+                        None => presence,
+                    });
+                    children_read += 1;
                     placed_items.push(placed);
                 }
             }
         }
         // How many children are there right now: `list.count`.
-        let how_many = presences.into_iter().reduce(|a, b| a + b).unwrap_or(Expr::K(0.0));
+        let how_many = present_so_far.unwrap_or(Expr::K(0.0));
 
         // How much room each one takes along the axis, and the most any of them takes across it.
         let length_of = |p: &Placed| if is_row { p.size.0.clone() } else { p.size.1.clone() };
@@ -4954,7 +4983,7 @@ impl<'a> Compiler<'a> {
             let along = if is_row { tw } else { th };
             let fixed_total = placed_items.iter().filter(|p| p.grow == 0.0).fold(Expr::K(0.0), |a, p| a + length_of(p) * p.visible.clone());
             let gaps = gap.clone() * (how_many.clone() - Expr::K(1.0)).max(Expr::K(0.0));
-            let left_over = (along - padding.clone() * 2.0 - gaps - fixed_total).max(Expr::K(0.0));
+            let left_over = self.shared("left", (along - padding.clone() * 2.0 - gaps - fixed_total).max(Expr::K(0.0)));
             for p in placed_items.iter_mut().filter(|p| p.grow > 0.0) {
                 let part = left_over.clone() * (p.grow / total_weight);
                 for k in p.own_instrs.clone() {
@@ -4980,8 +5009,12 @@ impl<'a> Compiler<'a> {
             let given = if is_row { th.clone() } else { tw.clone() };
             max_across = max_across.max((given - padding.clone() * 2.0).max(Expr::K(0.0)));
         }
+        let max_across = self.shared("across", max_across);
         // With `wrap`, the cell measures what the biggest child does, and each one goes to its own.
-        let cell_along = placed_items.iter().fold(Expr::K(0.0), |m, p| m.max(length_of(p))) + gap.clone();
+        let cell_along = match wrap {
+            Some(_) => self.shared("cell", placed_items.iter().fold(Expr::K(0.0), |m, p| m.max(length_of(p))) + gap.clone()),
+            None => Expr::K(0.0),
+        };
         let cell_across = max_across.clone() + gap.clone();
         let mut running = padding.clone();
         // How many of the earlier ones are there: what is not seen takes no cell.
@@ -4996,7 +5029,7 @@ impl<'a> Compiler<'a> {
                 let column = placed_so_far.clone() - grid_row.clone() * per_line;
                 along = padding.clone() + column * cell_along.clone();
                 grid_across = Some(padding.clone() + grid_row * cell_across.clone());
-                placed_so_far = placed_so_far + p.visible.clone();
+                placed_so_far = self.shared("placed", placed_so_far + p.visible.clone());
             }
             if let Some(m) = spring {
                 // The slot is a target: the child moves towards it with the stack's spring.
@@ -5011,7 +5044,8 @@ impl<'a> Compiler<'a> {
                     grid_across = Some(other.e());
                 }
             }
-            let across = grid_across.unwrap_or_else(|| padding.clone() + (max_across.clone() - breadth_of(p)) * align_factor);
+            // At the start of the breadth nothing is left to share out: it is the padding.
+            let across = grid_across.unwrap_or_else(|| if align_factor == 0.0 { padding.clone() } else { padding.clone() + (max_across.clone() - breadth_of(p)) * align_factor });
             let translate = if is_row { (along, across) } else { (across, along) };
             if let Instr::Transform(Some(t)) = &mut self.e.instrs[p.instr] {
                 t.translate = translate.clone();
@@ -5020,7 +5054,7 @@ impl<'a> Compiler<'a> {
                 c.under[level].translate = translate.clone();
             }
             let last = k + 1 == placed_items.len();
-            running = running + (length_of(p) + if last || p.separator { Expr::K(0.0) } else { gap.clone() }) * p.visible.clone();
+            running = self.shared("along", running + (length_of(p) + if last || p.separator { Expr::K(0.0) } else { gap.clone() }) * p.visible.clone());
         }
         let (total_along, total_across) = match wrap {
             // A grid measures what its lines do: the last one carries no gap after it.
@@ -5510,7 +5544,7 @@ impl<'a> Compiler<'a> {
         for r in 0..rows {
             tops.push(running.clone());
             let tallest = cells.iter().filter(|c| c.row == r).fold(Expr::K(0.0), |m, c| m.max(c.height.clone()));
-            running = running + tallest + gap.clone();
+            running = self.shared("top", running + tallest + gap.clone());
         }
         for c in &cells {
             let y = tops[c.row].clone();

@@ -253,7 +253,7 @@ scene Watching {
 | `figure hat = file "hat.svg"` | An svg **as geometry**: its layers become paths, each one named by the `id` of its group in the file. The path is relative to the file that writes it, so a library takes its pieces with it |
 | `shader aurora = file "aurora.wgsl"` | One of the scene's **own shaders**: a function in WGSL that paints a box, point by point. It is read and checked when the scene is read, and touching the file reloads it, like an svg. How it is written, in §8.1 |
 | `measure label` | Creates `label.width` and `label.height`, filled by the text that carries `measure: label` |
-| `let panel.x = orb.x + 62` · `let mint = #9ed6bd` | A name for an expression, or for a color. A small one is substituted where it is named; **a big one is computed once a frame** and what is named is that, so a chain of them —each naming the one before— costs a sum and not a product |
+| `let panel.x = orb.x + 62` · `let mint = #9ed6bd` | A name for an expression, or for a color. A small one is substituted where it is named; **a big one is computed once a frame** and what is named is that, so a chain of them —each naming the one before— costs a sum and not a product. A colour is the same, channel by channel |
 | `spring bouncy = 170, 12` | A spring of one's own: stiffness, damping. From the house: `lively`, `calm`, `quick`, `slow`, `gentle`, `pose`. Inline: `~spring(170, 12)`, or **`~620ms`**: the spring that gets there in that long without overshooting |
 | `zone box whole { at: …; size: …; active: expr }` | A zone that is not painted |
 
