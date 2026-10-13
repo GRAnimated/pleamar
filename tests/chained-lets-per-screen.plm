@@ -1,0 +1,21 @@
+// expect: ok
+language 0.1
+// A chain of `let`s that starts at `screen.height`, in a scene copied per
+// monitor: each link is each copy's own, so it is computed in one property
+// per copy. Substituted —as it was—, the tree doubled per link here too.
+scene ChainPerScreen {
+    surface { size: full, full; screens: each max 2 }
+    prop t = 0 ~300ms
+    fact going = false
+    follow t = if(going, 1, 0)
+    let sc = clamp(screen.height / 1350, 0.55, 1) * (1 + t * 0.2)
+    let a = 10 * sc + (40 * sc - 10 * sc) * t
+    let b = a + (60 * sc - a) * t
+    let c = b + (80 * sc - b) * t
+    let d = c + (100 * sc - c) * t
+    let e = d + (120 * sc - d) * t
+    let f = e + (140 * sc - e) * t
+    box { at: 100, 40; size: f, 20; corner: 6; color: #9ed6bd }
+    zone box hit { at: 100, 40; size: f, 40 }
+    on press hit { toggle going }
+}

@@ -411,3 +411,65 @@ pub fn closest_match<'a>(a: &str, known: impl Iterator<Item = &'a String>) -> Op
     };
     known.map(|c| (distance(a, c), c)).filter(|(d, c)| *d <= 1 + c.len() / 4).min_by_key(|(d, _)| *d).map(|(_, c)| c)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::scene::{Animated, Behavior, Ctx, Expr, Scene, Spring};
+    use crate::shapes::Shape;
+
+    /// The scene's bound properties, computed in their order with these facts and `t` at a half.
+    fn settled(scene: &Scene, facts: &[f32]) -> Vec<Animated> {
+        let mut props: Vec<Animated> = scene.props.iter().map(|(name, x, _)| Animated::at(if *name == "t" { 0.5 } else { *x }, Spring::LIVELY)).collect();
+        for b in &scene.behaviors {
+            if let Behavior::Bind { prop, to } = b {
+                let v = to.eval(Ctx { props: &props, facts, seen: None });
+                props[prop.0 as usize].x = v;
+            }
+        }
+        props
+    }
+
+    #[test]
+    fn a_chain_of_lets_from_the_screen_is_computed_once_per_copy() {
+        let (scene, _) = super::read_file(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/chained-lets-per-screen.plm")).unwrap();
+        // Each link names the previous one twice: substituted, the last one was
+        // hundreds of nodes, and here nothing is more than its own line.
+        let widths: Vec<(&str, &Expr)> = scene
+            .zones
+            .iter()
+            .map(|z| match &z.shape {
+                Shape::Rect { half_size, .. } => (z.id, &half_size.0),
+                _ => panic!("the zone is a box"),
+            })
+            .collect();
+        assert_eq!(widths.iter().map(|(id, _)| *id).collect::<Vec<_>>(), ["hit#screen0", "hit#screen1"], "one zone per monitor's copy");
+        for (id, w) in &widths {
+            assert!(w.node_count() <= 3, "{id} reads its width from a property, not from the whole chain: {w:?}");
+        }
+        for b in &scene.behaviors {
+            if let Behavior::Bind { to, .. } = b {
+                assert!(to.node_count() < 30, "a link reads the one before it from its property: {to:?}");
+            }
+        }
+        // And each copy's is its own: a monitor half as tall has the chain half as big.
+        let mut facts: Vec<f32> = scene.facts.iter().map(|(_, v)| *v).collect();
+        let fact = |name: &str| scene.facts.iter().position(|(n, _)| *n == name).unwrap_or_else(|| panic!("no fact {name}"));
+        facts[fact("screen.0.height")] = 1350.0;
+        facts[fact("screen.1.height")] = 675.0;
+        let props = settled(&scene, &facts);
+        let expected = |height: f32| {
+            let t = 0.5;
+            let sc = (height / 1350.0).clamp(0.55, 1.0) * (1.0 + t * 0.2);
+            let mut x = 10.0 * sc + (40.0 * sc - 10.0 * sc) * t;
+            for k in [60.0, 80.0, 100.0, 120.0, 140.0] {
+                x += (k * sc - x) * t;
+            }
+            x
+        };
+        for (id, w) in &widths {
+            let height = if id.ends_with("#screen1") { 675.0 } else { 1350.0 };
+            let got = w.eval(Ctx { props: &props, facts: &facts, seen: None }) * 2.0;
+            assert!((got - expected(height)).abs() < 1e-2, "{id}: {got} and it had to be {}", expected(height));
+        }
+    }
+}

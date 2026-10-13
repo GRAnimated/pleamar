@@ -336,6 +336,10 @@ struct Compiler<'a> {
     /// same property, not one more. Only the first copy's are kept: those are
     /// the ones the render always moves (a copy whose monitor is not there is not).
     let_props: HashMap<String, PropId>,
+    /// The properties of the loose `let`s that are each monitor's copy's own:
+    /// the one the scene reads, which has one more per copy. A `let` that
+    /// reads one of these is each copy's own too.
+    copy_props: std::collections::HashSet<u16>,
     /// Reading a monitor's copy other than the first.
     later_copy: bool,
     /// How many groups with effects are open around what is being read.
@@ -395,7 +399,7 @@ pub fn compile<'a>(tree: &'a [Entry], files: &'a [String], dirs: &'a [std::path:
             other => unreachable!("'{other}' is in the vocabulary, but it has no stiffness or damping"),
         })).collect(),
         under: Vec::new(), candidates: Vec::new(), zparents: vec![0], next_zparent: 1, zblock: None, rules: Vec::new(), errors: Vec::new(), declared: Vec::new(), used: Default::default(), current_class: String::new(),
-        scrolls: Vec::new(), row_scrolls: Default::default(), pending_surfaces: Vec::new(), pending_levels: Vec::new(), pending_reserves: Vec::new(), hover_mentions: Default::default(), zone_springs: Vec::new(), pending_anchors: Vec::new(), files, dirs, strict_files, libraries, boundary_of: HashMap::new(), permissions_of: HashMap::new(), pass: 0, next_origin: 0.0, values: HashMap::new(), ambiguous: Default::default(), instance_children: Vec::new(), from_library: Default::default(), unrequested: Default::default(), unwatched: Default::default(), hiding_noted: Default::default(), in_letters: Default::default(), scopes: Vec::new(), components: HashMap::new(), copies: 0, let_props: HashMap::new(), later_copy: false, effects_depth: 0, in_slot: false, last_size: None, imposed_measure: None, pending_keyboard: None, prop_sites: HashMap::new(),
+        scrolls: Vec::new(), row_scrolls: Default::default(), pending_surfaces: Vec::new(), pending_levels: Vec::new(), pending_reserves: Vec::new(), hover_mentions: Default::default(), zone_springs: Vec::new(), pending_anchors: Vec::new(), files, dirs, strict_files, libraries, boundary_of: HashMap::new(), permissions_of: HashMap::new(), pass: 0, next_origin: 0.0, values: HashMap::new(), ambiguous: Default::default(), instance_children: Vec::new(), from_library: Default::default(), unrequested: Default::default(), unwatched: Default::default(), hiding_noted: Default::default(), in_letters: Default::default(), scopes: Vec::new(), components: HashMap::new(), copies: 0, let_props: HashMap::new(), copy_props: Default::default(), later_copy: false, effects_depth: 0, in_slot: false, last_size: None, imposed_measure: None, pending_keyboard: None, prop_sites: HashMap::new(),
     };
     // Two facts that always exist: what the surface really measures. The
     // render sets them when the compositor configures it.
@@ -2089,26 +2093,24 @@ impl<'a> Compiler<'a> {
                     // Only a scene that is copied per monitor (or has several surfaces) needs it: with one surface, `screen.*`
                     // is worth the same everywhere, and a let that reads it can be computed once like any other.
                     let has_copies = self.e.surfaces.iter().any(|s| matches!(s.screens, Screens::Number(_))) || self.e.surfaces.len() > 1;
-                    let per_copy = has_copies && self.scopes.is_empty() && e.reads(|p| self.e.facts.get(p.0 as usize).is_some_and(|(n, _)| n.starts_with("screen.")));
+                    let per_copy = has_copies && self.scopes.is_empty() && self.is_per_copy(&e);
                     // The same one in every monitor's copy —it reads nothing of
                     // its copy— is one property: a property per copy was the
                     // same work once per monitor, and a rule naming it read
                     // differently in each copy, so it acted once per copy (a
                     // `toggle` in it undid itself).
-                    let e = if e.node_count() > 8 && !per_copy {
-                        let key = format!("{e:?}");
-                        match self.let_props.get(&key) {
-                            Some(p) => p.e(),
-                            None => {
-                                self.copies += 1;
-                                let p = self.e.prop_with(interned(&format!("·{name}{}", self.copies)), 0.0, Spring::LIVELY);
-                                self.e.behaviors.push(Behavior::Bind { prop: p, to: e });
-                                if !self.later_copy {
-                                    self.let_props.insert(key, p);
-                                }
-                                p.e()
-                            }
+                    // One that is each copy's own is a property too, **one per
+                    // copy** (below): left substituted, a chain of them —a scale
+                    // from `screen.height`, a size from that scale, a place from
+                    // that size— doubled per link like any other, and a bar
+                    // written that way kept trees of 190,000 nodes in single
+                    // instructions and gigabytes of them in all (issue 46).
+                    let e = if e.node_count() > 8 {
+                        let p = self.computed_once(&name, e);
+                        if per_copy {
+                            self.copy_props.insert(p.0);
                         }
+                        p.e()
                     } else {
                         e
                     };
@@ -2129,6 +2131,7 @@ impl<'a> Compiler<'a> {
                             let own = self.expr(&mut c2);
                             self.scopes.pop();
                             if let Ok(own) = own {
+                                let own = if own.node_count() > 8 { self.computed_once(&name, own).e() } else { own };
                                 self.lets.insert(format!("{name}#screen{k}"), own);
                             }
                         }
@@ -4072,6 +4075,37 @@ impl<'a> Compiler<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The property a big `let` is computed in, once per frame: the one that
+    /// already computes the same thing, or a new one.
+    fn computed_once(&mut self, name: &str, e: Expr) -> PropId {
+        let key = format!("{e:?}");
+        if let Some(p) = self.let_props.get(&key) {
+            return *p;
+        }
+        self.copies += 1;
+        let p = self.e.prop_with(interned(&format!("·{name}{}", self.copies)), 0.0, Spring::LIVELY);
+        self.e.behaviors.push(Behavior::Bind { prop: p, to: e });
+        if !self.later_copy {
+            self.let_props.insert(key, p);
+        }
+        p
+    }
+
+    /// Whether a loose `let` is worth something different in each monitor's
+    /// copy: it reads `screen.*`, or another `let` that does and is computed
+    /// in a property per copy.
+    fn is_per_copy(&self, e: &Expr) -> bool {
+        if e.reads(|p| self.e.facts.get(p.0 as usize).is_some_and(|(n, _)| n.starts_with("screen."))) {
+            return true;
+        }
+        if self.copy_props.is_empty() {
+            return false;
+        }
+        let (mut props, mut facts) = (Vec::new(), Vec::new());
+        e.inputs(&mut props, &mut facts);
+        props.iter().any(|p| self.copy_props.contains(p))
     }
 
     /// Inside a `screens: each` surface: what holds for that copy.
