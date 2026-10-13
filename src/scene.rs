@@ -1705,6 +1705,9 @@ pub enum Effect {
     WindowToWorkspace(Expr, Expr, Option<Expr>),
     /// `send workspace n [on s] to t`: a whole workspace to another monitor.
     WorkspaceTo(Expr, Option<Expr>, Expr),
+    /// `close workspace n [on s]`: that workspace gone, its windows to the one
+    /// before it (to the next, from the first). The last one left stays.
+    WorkspaceClose(Expr, Option<Expr>),
     /// The answer to what the compositor asked the scene to choose (`win.picking`:
     /// what to share of the screen): a window (`pick win(x)`, true), a monitor
     /// (`pick screen 1`, false), or nothing (`pick none`).
@@ -1745,6 +1748,7 @@ impl Effect {
             Effect::WindowToWorkspace(w, to, on) => Effect::WindowToWorkspace(w.with_payload(v), to.with_payload(v), on.as_ref().map(|e| e.with_payload(v))),
             Effect::Dock(k, on, a) => Effect::Dock(k.with_payload(v), on.as_ref().map(|e| e.with_payload(v)), *a),
             Effect::WorkspaceTo(n, on, to) => Effect::WorkspaceTo(n.with_payload(v), on.as_ref().map(|e| e.with_payload(v)), to.with_payload(v)),
+            Effect::WorkspaceClose(n, on) => Effect::WorkspaceClose(n.with_payload(v), on.as_ref().map(|e| e.with_payload(v))),
             Effect::Pick(Some((window, e))) => Effect::Pick(Some((*window, e.with_payload(v)))),
             other => other.clone(),
         }
@@ -2209,6 +2213,12 @@ pub struct Nest {
     /// list is that one, an item counts all its program's windows, and a
     /// press on it goes to the one used last, its workspace shown with it.
     pub programs: bool,
+    /// `workspaces kept`: a monitor's workspaces are the ones made, and stay
+    /// while empty and out of sight, as a Mac's desktops: one more is made by
+    /// going one past the last, and one goes when it is closed (`close
+    /// workspace`). Without it they are tide pools: an empty one not shown
+    /// dries up.
+    pub kept: bool,
 }
 
 /// A program pinned to the dock: the names its windows go by (their app id

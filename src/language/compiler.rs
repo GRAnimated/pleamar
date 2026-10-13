@@ -5709,6 +5709,13 @@ impl<'a> Compiler<'a> {
         } else {
             false
         };
+        // `workspaces kept`: they stay while empty (see `Nest::kept`).
+        let kept = if c.word("workspaces") {
+            c.expect_word("kept")?;
+            true
+        } else {
+            false
+        };
         c.expect_end()?;
         if self.e.nest.is_some() {
             return Err(CompileError::at(n.line, n.col, "a scene holds one set of windows: this is the second `windows`"));
@@ -5810,7 +5817,7 @@ impl<'a> Compiler<'a> {
         self.texts.insert(full, id);
         // The right button is the windows' as well: it no longer closes the scene.
         self.e.surface_mut().right_click_quits = false;
-        self.e.nest = Some(crate::scene::Nest { name, max, programs });
+        self.e.nest = Some(crate::scene::Nest { name, max, programs, kept });
         Ok(())
     }
 
@@ -6267,6 +6274,15 @@ impl<'a> Compiler<'a> {
                         "toggle" => Effect::Toggle(self.fact(&mut c)?),
                         "blur" => Effect::FocusField(None),
                         "focus" if self.names_window(&c) => Effect::Window(WindowAction::Focus, self.which_window(&mut c)?),
+                        // `close workspace 2 on 0`: that workspace gone, its windows to the one beside.
+                        "close" if c.word("workspace") => {
+                            if self.e.nest.is_none() {
+                                return c.error("`close workspace` closes one of the scene's windows' workspaces: declare them first, `windows win max 16`");
+                            }
+                            let n = self.expr(&mut c)?;
+                            let on = if c.word("on") { Some(self.expr(&mut c)?) } else { None };
+                            Effect::WorkspaceClose(n, on)
+                        }
                         "close" => Effect::Window(WindowAction::Close, self.which_window(&mut c)?),
                         "promote" => Effect::Window(WindowAction::Promote, self.which_window(&mut c)?),
                         "fullscreen" => Effect::Window(WindowAction::Fullscreen, self.which_window(&mut c)?),

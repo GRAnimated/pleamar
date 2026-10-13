@@ -98,6 +98,8 @@ struct Desks {
     /// `dock programs` (see `Nest::programs`): the docks are one, of every
     /// program with a window anywhere.
     programs: bool,
+    /// `workspaces kept` (see `Nest::kept`): an empty one stays.
+    kept: bool,
     /// The programs pinned, and each monitor's dock as last worked out.
     pins: Vec<crate::scene::DockPin>,
     items: [Vec<DockItem>; 4],
@@ -115,7 +117,7 @@ struct DockItem {
 
 impl Default for Desks {
     fn default() -> Self {
-        Desks { pool: Vec::new(), alive: Vec::new(), stack: [vec![1], vec![2], vec![3], vec![4]], shown: [1, 2, 3, 4], left: [0; 4], last: Default::default(), next: 5, apps: Vec::new(), icons: Vec::new(), names: Vec::new(), execs: Vec::new(), dialog: Vec::new(), minimized: Vec::new(), floating: Vec::new(), born: Vec::new(), stamp: 0, focus: None, touched: Vec::new(), programs: false, pins: Vec::new(), items: Default::default() }
+        Desks { pool: Vec::new(), alive: Vec::new(), stack: [vec![1], vec![2], vec![3], vec![4]], shown: [1, 2, 3, 4], left: [0; 4], last: Default::default(), next: 5, apps: Vec::new(), icons: Vec::new(), names: Vec::new(), execs: Vec::new(), dialog: Vec::new(), minimized: Vec::new(), floating: Vec::new(), born: Vec::new(), stamp: 0, focus: None, touched: Vec::new(), programs: false, kept: false, pins: Vec::new(), items: Default::default() }
     }
 }
 
@@ -222,10 +224,12 @@ impl Desks {
     }
 
     /// The pool at turn `n` of a monitor: no further than one past the last
-    /// that holds windows, which is a new, empty one.
+    /// that holds windows, which is a new, empty one. (Kept, one past the
+    /// last there is: empty ones count.)
     fn at(&mut self, screen: usize, n: usize, screens: &[usize]) -> u32 {
         let s = screen.min(3);
-        let n = n.clamp(1, self.used(s, screens) + 1);
+        let most = if self.kept { self.stack[s].len() } else { self.used(s, screens) };
+        let n = n.clamp(1, most + 1);
         match self.stack[s].get(n - 1) {
             Some(id) => *id,
             None => {
@@ -243,6 +247,10 @@ impl Desks {
             if !self.stack[s].contains(&self.shown[s]) {
                 self.stack[s].push(self.shown[s]);
             }
+            // (Kept, none dries up: they go when they are closed.)
+            if self.kept {
+                continue;
+            }
             let stack = std::mem::take(&mut self.stack[s]);
             self.stack[s] = stack.into_iter().filter(|id| *id == self.shown[s] || self.holds(s, *id, screens)).collect();
         }
@@ -257,6 +265,7 @@ impl Desks {
 fn nest_places(scene: &Scene, facts: &mut [f32], texts: &mut [String], to_logic: &Sender<Event>, n: &crate::scene::Nest, order: &[usize], screens: &[usize], desks: &mut Desks) {
     desks.grow(n.max);
     desks.programs = n.programs;
+    desks.kept = n.kept;
     desks.compact(screens);
     for s in 0..4 {
         desks.work_dock(s, screens);
@@ -2784,6 +2793,33 @@ pub fn run(
                     // A whole pool to another monitor, with its windows: it goes to the
                     // end of that one's stack and is shown there; this one shows the
                     // pool beside it.
+                    // A workspace closed: its windows go to the one before it (to the
+                    // next, from the first), which is shown if this one was. The
+                    // only one a monitor has stays.
+                    Effect::WorkspaceClose(ws, on) => {
+                        let c = Ctx { props: &props, facts: &facts, seen: None };
+                        let ws = ws.eval(c).round().max(1.0) as usize;
+                        let screen = on.map_or(nest_on_screen.unwrap_or(0) as f32, |e| e.eval(c)).round().clamp(0.0, 3.0) as usize;
+                        if let Some(n) = scene.nest.clone() {
+                            desks.grow(n.max);
+                            if desks.stack[screen].len() > 1 && ws <= desks.stack[screen].len() {
+                                let id = desks.stack[screen].remove(ws - 1);
+                                let beside = desks.stack[screen][ws.saturating_sub(2).min(desks.stack[screen].len() - 1)];
+                                for k in 0..desks.pool.len() {
+                                    if desks.alive(k) && desks.pool[k] == id {
+                                        desks.pool[k] = beside;
+                                    }
+                                }
+                                if let Some(k) = desks.last.remove(&id) {
+                                    desks.last.entry(beside).or_insert(k);
+                                }
+                                if desks.shown[screen] == id {
+                                    desks.shown[screen] = beside;
+                                }
+                                nest_places(&scene, &mut facts, &mut texts, &to_logic, &n, &nest_order, &nest_screens, &mut desks);
+                            }
+                        }
+                    }
                     Effect::WorkspaceTo(ws, on, to) => {
                         let c = Ctx { props: &props, facts: &facts, seen: None };
                         let ws = ws.eval(c).round().max(1.0) as usize;
@@ -4913,6 +4949,34 @@ mod dock_tests {
         assert_eq!(names(&desks), ["kitty", "telegram", "zen"]);
         assert_eq!(desks.items[1].len(), 3);
         assert_eq!(desks.docked(0, &screens), [0, 1, 2]);
+    }
+
+    #[test]
+    fn kept_workspaces_stay_while_empty_and_tide_pools_dry_up() {
+        // One window on the first monitor's first workspace; a second, empty one after it.
+        let fresh = |kept: bool| {
+            let mut desks = Desks::default();
+            desks.grow(1);
+            desks.kept = kept;
+            desks.alive[0] = true;
+            desks.pool[0] = 1;
+            desks.stack[0] = vec![1, 9];
+            desks
+        };
+        let screens = [0];
+        // A tide pool: empty and not shown, it dries up; and no further than one past the last with windows.
+        let mut pools = fresh(false);
+        pools.compact(&screens);
+        assert_eq!(pools.stack[0], [1]);
+        let second = pools.at(0, 7, &screens);
+        assert_eq!(pools.index(0, second), 2);
+        // Kept: it stays, and one past the last there is makes another.
+        let mut kept = fresh(true);
+        kept.compact(&screens);
+        assert_eq!(kept.stack[0], [1, 9]);
+        assert_eq!(kept.at(0, 2, &screens), 9);
+        let third = kept.at(0, 9, &screens);
+        assert_eq!((kept.index(0, third), kept.stack[0].len()), (3, 3));
     }
 }
 

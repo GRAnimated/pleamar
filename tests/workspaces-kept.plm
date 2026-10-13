@@ -1,0 +1,25 @@
+// expect: ok
+language 0.1
+// `workspaces kept`: a monitor's workspaces are the ones made, empty or not,
+// as a Mac's desktops. One more by going one past the last; one less with
+// `close workspace`, whose windows go to the one beside.
+scene DesktopsKept {
+    surface { size: full, 40; anchor: top }
+    windows win max 4 dock programs workspaces kept
+    row { at: 8, 6; gap: 6
+        repeat k in 0..6 {
+            group { size: 60, 28; show: k < win.pools.0
+                box { from: 0, 0; size: 60, 28; corner: 8; color: #2f3a37; opacity: if(win.shown.0 == k + 1, 100%, 45%) }
+                zone box desk { from: 0, 0; size: 44, 28 }
+                zone box shut { from: 44, 0; size: 16, 28 }
+                on press desk { workspace k + 1 on 0 }
+                on press shut { close workspace k + 1 on 0 }
+            }
+        }
+        group { size: 28, 28
+            box { from: 0, 0; size: 28, 28; corner: 8; color: #9ed6bd }
+            zone box more { from: 0, 0; size: 28, 28 }
+            on press more { workspace win.pools.0 + 1 on 0 }
+        }
+    }
+}

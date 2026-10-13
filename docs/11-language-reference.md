@@ -1208,8 +1208,11 @@ that holds), which are the scene's.
 | `send win(win.focus) to workspace 2` · `… to workspace 2 on 1` | that window to that workspace, on its monitor or on that one (the same limit) |
 | `dock 2 on 0` · `dock k` | that item of monitor `s`'s dock (the one the pointer is on, without `on`): its window —the next one, if one of them has the keyboard; brought back, if put away— or, with none there, its program started. With `dock programs`, the window of its program that had the keyboard last, wherever it is: its workspace is shown with it (and so is that of any window a `focus win…` gives the keyboard to) |
 | `dock k on s with drop` · `… pin` · `… unpin` · `… close` | the files just dropped on it (`on drop zone`) opened with its program; the program pinned to the dock, or unpinned (the compositor keeps it: pleamar-wm writes its `dock` line); its windows there asked to close |
+| `close workspace 2` · `close workspace n on 1` | that workspace gone, from the monitor the pointer is on or from that one: its windows go to the one before it (to the next, from the first), which is shown if this one was. The only one a monitor has stays |
 | `send workspace 2 on 0 to 1` · `send workspace n to 1` | the whole workspace, with its windows, to that monitor —from the one the pointer is on, without `on`—: it goes to the end of that one's stack and is shown there; the monitor it left shows the one beside it |
 | `pick win.$i` · `pick win(x)` · `pick screen 1` · `pick none` | the answer to `win.picking`: that window, that monitor, or nothing (the program's request is turned down). The compositor stops asking: `win.picking` goes back to 0 |
+
+**Workspaces that stay: `windows win max 16 workspaces kept`.** As they come, workspaces are tide pools (below): an empty one that is not shown dries up, and there is never more than one empty past the last with windows. With `workspaces kept` they are a Mac's desktops: the ones a monitor has are the ones made, empty or not, shown or not. One more is made by going one past the last (`workspace win.pools.0 + 1 on 0`), and one goes only when it is closed (`close workspace n`). `dock programs` and `workspaces kept` go in that order when both are written.
 
 **Workspaces** are a stack per monitor, each monitor its own, as tide
 pools along a shore: there are as many as hold windows, plus the one shown
