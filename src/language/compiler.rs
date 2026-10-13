@@ -5701,6 +5701,14 @@ impl<'a> Compiler<'a> {
     fn windows(&mut self, n: &'a Node, c: &mut Cur) -> R<()> {
         let name = self.declare(&c.id("a name for the windows")?);
         let max = if c.word("max") { c.num()? as usize } else { 8 };
+        // `dock programs`: one dock for the session, of the programs running
+        // wherever their windows are (see `Nest::programs`).
+        let programs = if c.word("dock") {
+            c.expect_word("programs")?;
+            true
+        } else {
+            false
+        };
         c.expect_end()?;
         if self.e.nest.is_some() {
             return Err(CompileError::at(n.line, n.col, "a scene holds one set of windows: this is the second `windows`"));
@@ -5802,7 +5810,7 @@ impl<'a> Compiler<'a> {
         self.texts.insert(full, id);
         // The right button is the windows' as well: it no longer closes the scene.
         self.e.surface_mut().right_click_quits = false;
-        self.e.nest = Some(crate::scene::Nest { name, max });
+        self.e.nest = Some(crate::scene::Nest { name, max, programs });
         Ok(())
     }
 

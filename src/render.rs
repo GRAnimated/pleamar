@@ -92,6 +92,12 @@ struct Desks {
     born: Vec<u64>,
     stamp: u64,
     focus: Option<usize>,
+    /// When each slot last had the keyboard (0: never): the one a program's
+    /// dock item goes to.
+    touched: Vec<u64>,
+    /// `dock programs` (see `Nest::programs`): the docks are one, of every
+    /// program with a window anywhere.
+    programs: bool,
     /// The programs pinned, and each monitor's dock as last worked out.
     pins: Vec<crate::scene::DockPin>,
     items: [Vec<DockItem>; 4],
@@ -109,7 +115,7 @@ struct DockItem {
 
 impl Default for Desks {
     fn default() -> Self {
-        Desks { pool: Vec::new(), alive: Vec::new(), stack: [vec![1], vec![2], vec![3], vec![4]], shown: [1, 2, 3, 4], left: [0; 4], last: Default::default(), next: 5, apps: Vec::new(), icons: Vec::new(), names: Vec::new(), execs: Vec::new(), dialog: Vec::new(), minimized: Vec::new(), floating: Vec::new(), born: Vec::new(), stamp: 0, focus: None, pins: Vec::new(), items: Default::default() }
+        Desks { pool: Vec::new(), alive: Vec::new(), stack: [vec![1], vec![2], vec![3], vec![4]], shown: [1, 2, 3, 4], left: [0; 4], last: Default::default(), next: 5, apps: Vec::new(), icons: Vec::new(), names: Vec::new(), execs: Vec::new(), dialog: Vec::new(), minimized: Vec::new(), floating: Vec::new(), born: Vec::new(), stamp: 0, focus: None, touched: Vec::new(), programs: false, pins: Vec::new(), items: Default::default() }
     }
 }
 
@@ -126,7 +132,20 @@ impl Desks {
             self.minimized.resize(max, false);
             self.floating.resize(max, false);
             self.born.resize(max, 0);
+            self.touched.resize(max, 0);
         }
+    }
+
+    /// The windows a monitor's dock is made of and counts: the ones on the
+    /// workspace it shows; with `dock programs`, every one there is, on any
+    /// monitor and any workspace. As they opened.
+    fn docked(&self, screen: usize, screens: &[usize]) -> Vec<usize> {
+        if !self.programs {
+            return self.here(screen, screens);
+        }
+        let mut v: Vec<usize> = (0..self.pool.len()).filter(|k| self.alive(*k) && !self.dialog[*k]).collect();
+        v.sort_by_key(|k| self.born[*k]);
+        v
     }
 
     /// Whether that slot's window belongs to that dock item.
@@ -162,7 +181,7 @@ impl Desks {
     /// on the workspace it shows, in the order they opened.
     fn work_dock(&mut self, screen: usize, screens: &[usize]) {
         let mut items: Vec<DockItem> = self.pins.iter().enumerate().map(|(k, p)| DockItem { key: p.keys.first().cloned().unwrap_or_default(), pin: Some(k), icon: p.icon.clone(), exec: p.exec.clone(), name: p.name.clone() }).collect();
-        for slot in self.here(screen, screens) {
+        for slot in self.docked(screen, screens) {
             if self.apps[slot].is_empty() || items.iter().any(|i| self.of_item(slot, i)) {
                 continue;
             }
@@ -237,6 +256,7 @@ impl Desks {
 /// is laid out all the same: its windows are in their places when it slides in.
 fn nest_places(scene: &Scene, facts: &mut [f32], texts: &mut [String], to_logic: &Sender<Event>, n: &crate::scene::Nest, order: &[usize], screens: &[usize], desks: &mut Desks) {
     desks.grow(n.max);
+    desks.programs = n.programs;
     desks.compact(screens);
     for s in 0..4 {
         desks.work_dock(s, screens);
@@ -278,10 +298,11 @@ fn nest_places(scene: &Scene, facts: &mut [f32], texts: &mut [String], to_logic:
     for s in 0..4 {
         let items = &desks.items[s];
         let here = desks.here(s, screens);
+        let docked = desks.docked(s, screens);
         nest_fact(scene, facts, to_logic, &format!("{name}.docks.{s}"), items.len() as f32);
         for k in 0..crate::scene::DOCK_ITEMS {
             let item = items.get(k);
-            let mine: Vec<usize> = item.map(|i| here.iter().copied().filter(|w| desks.of_item(*w, i)).collect()).unwrap_or_default();
+            let mine: Vec<usize> = item.map(|i| docked.iter().copied().filter(|w| desks.of_item(*w, i)).collect()).unwrap_or_default();
             nest_text(scene, texts, to_logic, &format!("{name}.dock.{s}.{k}.icon"), item.map_or(String::new(), |i| i.icon.clone()));
             nest_text(scene, texts, to_logic, &format!("{name}.dock.{s}.{k}.name"), item.map_or(String::new(), |i| i.name.clone()));
             nest_fact(scene, facts, to_logic, &format!("{name}.dock.{s}.{k}.badge"), item.map_or(0.0, |i| desks.badge(i, &badges)));
@@ -296,12 +317,14 @@ fn nest_places(scene: &Scene, facts: &mut [f32], texts: &mut [String], to_logic:
     for k in 0..n.max {
         let s = screen_of(k).min(3);
         let here = desks.shown_here(k, screens) && desks.alive(k);
-        let at = if here { desks.items[s].iter().position(|i| desks.of_item(k, i)).map_or(-1.0, |p| p as f32) } else { -1.0 };
+        // (With `dock programs` every window has its item, shown or not.)
+        let docked = if desks.programs { desks.alive(k) && !desks.dialog[k] } else { here };
+        let at = if docked { desks.items[s].iter().position(|i| desks.of_item(k, i)).map_or(-1.0, |p| p as f32) } else { -1.0 };
         nest_fact(scene, facts, to_logic, &format!("{name}.{k}.dockat"), at);
         let minat = if here && desks.minimized[k] { desks.here(s, screens).iter().filter(|w| desks.minimized[**w]).position(|w| *w == k).map_or(-1.0, |p| p as f32) } else { -1.0 };
         nest_fact(scene, facts, to_logic, &format!("{name}.{k}.minat"), minat);
         // Its turn among its item's windows there (for a row of their previews).
-        let turn = if here && at >= 0.0 { desks.here(s, screens).iter().filter(|w| desks.items[s].get(at as usize).is_some_and(|i| desks.of_item(**w, i))).position(|w| *w == k).map_or(-1.0, |p| p as f32) } else { -1.0 };
+        let turn = if docked && at >= 0.0 { desks.docked(s, screens).iter().filter(|w| desks.items[s].get(at as usize).is_some_and(|i| desks.of_item(**w, i))).position(|w| *w == k).map_or(-1.0, |p| p as f32) } else { -1.0 };
         nest_fact(scene, facts, to_logic, &format!("{name}.{k}.dockturn"), turn);
     }
 }
@@ -1525,6 +1548,9 @@ pub fn run(
                         NestEvent::Focused(which) => {
                             if let Some(k) = which {
                                 desks.last.insert(desks.pool_of(k), k);
+                                desks.grow(n.max.max(k + 1));
+                                desks.stamp += 1;
+                                desks.touched[k] = desks.stamp;
                             }
                             desks.focus = which;
                             nest_places(&scene, &mut facts, &mut texts, &to_logic, &n, &nest_order, &nest_screens, &mut desks);
@@ -2621,6 +2647,16 @@ pub fn run(
                         let slot = which.eval(Ctx { props: &props, facts: &facts, seen: None }).round();
                         if let (Some(send), true) = (&nest, slot >= 0.0) {
                             let slot = slot as usize;
+                            // With `dock programs` a window given the keyboard is
+                            // seen: the workspace it is on is shown on its monitor.
+                            if let (WindowAction::Focus, Some(n)) = (action, scene.nest.clone().filter(|n| n.programs && slot < n.max)) {
+                                desks.grow(n.max);
+                                let screen = nest_screens.get(slot).copied().unwrap_or(0).min(3);
+                                if desks.alive(slot) && desks.pool[slot] != 0 && desks.pool[slot] != desks.shown[screen] {
+                                    desks.shown[screen] = desks.pool[slot];
+                                    nest_places(&scene, &mut facts, &mut texts, &to_logic, &n, &nest_order, &nest_screens, &mut desks);
+                                }
+                            }
                             send(match action {
                                 WindowAction::Focus => ToNest::Focus(slot),
                                 WindowAction::Close => ToNest::Close(slot),
@@ -2704,7 +2740,7 @@ pub fn run(
                         if let (Some(n), Some(send), true) = (scene.nest.clone(), &nest, k >= 0.0) {
                             desks.grow(n.max);
                             if let Some(item) = desks.items[screen].get(k as usize).cloned() {
-                                let mine: Vec<usize> = desks.here(screen, &nest_screens).into_iter().filter(|w| desks.of_item(*w, &item)).collect();
+                                let mine: Vec<usize> = desks.docked(screen, &nest_screens).into_iter().filter(|w| desks.of_item(*w, &item)).collect();
                                 // Files dropped on it: opened with it (one `sh -c`, each path quoted).
                                 if what == crate::scene::DockAction::OpenDrop {
                                     let paths: Vec<String> = drops.iter().flat_map(|(_, d)| d.lines().map(str::trim).filter_map(|l| l.strip_prefix("file://")).map(percent_decode).collect::<Vec<_>>()).collect();
@@ -2726,10 +2762,19 @@ pub fn run(
                                     let at = desks.focus.and_then(|f| mine.iter().position(|w| *w == f));
                                     let slot = match at {
                                         Some(p) => mine[(p + 1) % mine.len()],
+                                        // A program's (`dock programs`): the one that had the
+                                        // keyboard last, one that is out before one put away.
+                                        None if desks.programs => mine.iter().copied().max_by_key(|w| (!desks.minimized[*w], desks.touched[*w])).unwrap_or(mine[0]),
                                         None => mine.iter().copied().find(|w| !desks.minimized[*w]).unwrap_or(mine[0]),
                                     };
                                     if desks.minimized[slot] {
                                         send(ToNest::Minimize(slot, false));
+                                    }
+                                    // And it is seen: on another workspace, that one is shown.
+                                    let at_screen = nest_screens.get(slot).copied().unwrap_or(0).min(3);
+                                    if desks.programs && desks.pool[slot] != 0 && desks.pool[slot] != desks.shown[at_screen] {
+                                        desks.shown[at_screen] = desks.pool[slot];
+                                        nest_places(&scene, &mut facts, &mut texts, &to_logic, &n, &nest_order, &nest_screens, &mut desks);
                                     }
                                     send(ToNest::Focus(slot));
                                 }
@@ -4837,6 +4882,38 @@ struct ComposeMemo {
     order: Option<Vec<usize>>,
     selected: Option<(usize, usize, usize)>,
     signal_times: Vec<f32>,
+}
+
+#[cfg(test)]
+mod dock_tests {
+    use super::*;
+
+    #[test]
+    fn a_dock_of_programs_counts_windows_on_any_monitor_and_workspace() {
+        // Three windows: a terminal on the first monitor's workspace, a chat on
+        // the second monitor, a browser on a workspace the first does not show.
+        let mut desks = Desks::default();
+        desks.grow(3);
+        for (k, (app, pool)) in [("kitty", 1), ("telegram", 2), ("zen", 5)].into_iter().enumerate() {
+            desks.alive[k] = true;
+            desks.apps[k] = app.to_owned();
+            desks.pool[k] = pool;
+            desks.born[k] = k as u64 + 1;
+        }
+        desks.stack[0] = vec![1, 5];
+        let screens = [0, 1, 0];
+        let names = |d: &Desks| d.items[0].iter().map(|i| i.key.clone()).collect::<Vec<_>>();
+        // A shore of its own monitor: only what is on the workspace it shows.
+        desks.work_dock(0, &screens);
+        assert_eq!(names(&desks), ["kitty"]);
+        // A dock of programs: all three, as they opened, on every monitor's list.
+        desks.programs = true;
+        desks.work_dock(0, &screens);
+        desks.work_dock(1, &screens);
+        assert_eq!(names(&desks), ["kitty", "telegram", "zen"]);
+        assert_eq!(desks.items[1].len(), 3);
+        assert_eq!(desks.docked(0, &screens), [0, 1, 2]);
+    }
 }
 
 #[cfg(test)]

@@ -2204,6 +2204,11 @@ pub enum ToRender {
 pub struct Nest {
     pub name: String,
     pub max: usize,
+    /// `dock programs`: the dock is of the programs running, wherever their
+    /// windows are —any monitor, any workspace—, as a Mac's: every monitor's
+    /// list is that one, an item counts all its program's windows, and a
+    /// press on it goes to the one used last, its workspace shown with it.
+    pub programs: bool,
 }
 
 /// A program pinned to the dock: the names its windows go by (their app id

@@ -1,0 +1,20 @@
+// expect: ok
+language 0.1
+// `dock programs`: one dock for the session, of the programs running wherever
+// their windows are, as a Mac's. Every window has its item (`dockat`), on any
+// monitor and any workspace, and a press on an item goes to the one used last.
+scene DockOfPrograms {
+    surface { size: full, 64; anchor: bottom }
+    windows win max 4 dock programs
+    row { at: 12, 8; gap: 8
+        repeat k in 0..6 {
+            group { size: 48, 48; show: k < win.docks.0
+                box { from: 0, 0; size: 48, 48; corner: 12; color: #2f3a37 }
+                box { at: 24, 44; size: 4, 4; corner: 2; color: #9ed6bd; show: win.dock.0.$k.windows > 0 }
+                zone box item { from: 0, 0; size: 48, 48 }
+                on press item { dock k on 0 }
+            }
+        }
+    }
+    text "{win.0.dockat}" { at: 12, 60; size: 9; color: #f5f7f5 }
+}
