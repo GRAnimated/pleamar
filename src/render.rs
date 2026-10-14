@@ -534,6 +534,10 @@ pub fn run(
     let mut cursor: Option<((f32, f32), Vec<(String, [i32; 4])>)> = None;
     // What is being dragged: which zone, and where the mouse was when pressed.
     let mut drag: Option<(usize, (f32, f32), Instant)> = None;
+    // A window asked to be carried or stretched from its own frame (slot, 1
+    // carried or 2 stretched, edges; 0 let go), and the handle pressed for it.
+    let mut handle_asked: Option<(usize, u32, u32)> = None;
+    let mut handle_held: Option<usize> = None;
     let mut cursor_set = Cursor::Normal;
 
     // The keyboard that has been asked of the compositor, whether it has the focus, and whether it has
@@ -1378,6 +1382,7 @@ pub fn run(
                         NestEvent::Held { slot, how, edges } => {
                             nest_fact(&scene, &mut facts, &to_logic, &format!("{name}.{slot}.edges"), edges as f32);
                             nest_fact(&scene, &mut facts, &to_logic, &format!("{name}.{slot}.held"), how as f32);
+                            handle_asked = Some((slot, how, edges));
                         }
                         NestEvent::Minimized(slot, yes) => {
                             // Brought back, it comes to the workspace its monitor shows:
@@ -2139,6 +2144,56 @@ pub fn run(
                 // (The side buttons —back, forward— are the windows' alone.)
                 (b, true) if b <= 2 => pressed_with = hovered.map(|k| (k, b)),
                 _ => {}
+            }
+        }
+        // A window that draws its own frame (a GTK 4 header bar, a browser's
+        // tabs) asks to be carried from it, or stretched by one of its edges:
+        // the zone that is its handle (`handle:`) is pressed for it, on the
+        // copy of the scene the pointer is over, as if pressed there —its
+        // rules, its drag and its release are the scene's own—, and let go
+        // when the button goes up.
+        if let Some((slot, how, edges)) = handle_asked.take() {
+            if how == 0 {
+                if let Some(k) = handle_held.take()
+                    && drag.is_some_and(|d| d.0 == k)
+                {
+                    drag = None;
+                    released = Some(k);
+                    let _ = to_logic.send(Event::Release(scene.zones[k].id));
+                }
+            } else if let Some(p) = pointer {
+                let copy = sheets
+                    .iter()
+                    .filter(|l| l.view.popup.is_none())
+                    .find(|l| {
+                        let v = l.view.bounds();
+                        p.0 >= v[0] && p.0 < v[2] && p.1 >= v[1] && p.1 < v[3]
+                    })
+                    .and_then(|l| scene.surfaces.get(l.view.surface))
+                    .map(|s| format!("#screen{}", s.instance));
+                let want = if how == 1 { 0 } else { edges };
+                let c = Ctx { props: &props, facts: &facts, seen: None };
+                // Its handle by that edge; else the one that shares most of it
+                // (a top corner asked for, the side one).
+                let found = scene
+                    .zones
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(k, z)| {
+                        let h = z.handle.as_ref()?;
+                        let mine = (h.window.eval(c) - slot as f32).abs() < 0.5;
+                        let here = !z.id.contains("#screen") || copy.as_ref().is_some_and(|m| z.id.ends_with(m.as_str()));
+                        let fit = if h.edges == want { 3 } else if want != 0 && h.edges & want != 0 { (h.edges & want).count_ones() } else { 0 };
+                        (mine && here && fit > 0 && z.active.is_true(c)).then_some((fit, k))
+                    })
+                    .max_by_key(|(fit, _)| *fit)
+                    .map(|(_, k)| k);
+                if let Some(k) = found {
+                    pressed = Some(k);
+                    drag = Some((k, p, now));
+                    handle_held = Some(k);
+                    let _ = to_logic.send(Event::Press(scene.zones[k].id));
+                }
             }
         }
         // A prototype's emergency exit —the right button closes— must not

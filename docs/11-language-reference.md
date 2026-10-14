@@ -1162,6 +1162,7 @@ reloads on save while the programs in it keep running.
 | `win.$i.urgent` | it asks for attention: it asked to come forward with nothing of the user's behind it (a message arrived while another window had the keyboard). Until it gets the keyboard. A dock makes its icon hop, as macOS does |
 | `win.$i.framed` | it lets the compositor draw its frame (server-side decorations, X11 programs): draw its title bar. False, it draws its own —a GTK 4 header bar, a browser's tabs—: draw none |
 | `win.$i.held` · `win.$i.edges` | what it asks from its own title bar or edges while the button is down: 1 to be carried with the mouse, 2 to be stretched by `edges` (1 top, 2 bottom, 4 left, 8 right, added: 10 is the bottom right corner); 0 when the button is let go. Floating windows follow `cursor.x`, `cursor.y` while it lasts |
+| `handle: i` · `handle: i, left` (on a zone) | the zone is window `i`'s handle: by which it is carried, or stretched by that edge (`top`, `bottom`, `left`, `right`, `top_left`, `top_right`, `bottom_left`, `bottom_right`). When the window asks from its own title bar or edges (`win.$i.held`), the zone is pressed for it, on the monitor's copy the mouse is over, and let go with the button: its `press`, `drag` and `release` rules are the ones that carry or stretch it, the same as when the zone itself is pressed. An edge that has no zone of its own gets the one that shares the most of it; a zone that is not `active:` is not pressed |
 | `win.$i.fullscreen` | it is fullscreen: it asked (a video, a game, F11) or the scene did. Where it goes is still the scene's: draw it over the whole monitor, and ask it for that size |
 | `win.$i.workspace` | the workspace it is on, by its turn in its monitor's stack (from 1): the one its monitor showed when it opened, or the one it was sent to. It changes when one above it dries up |
 | `win.$i.pool` | the same workspace by its identity, which never changes: compare this one to tell whether two windows share a workspace, or whether it is the one shown (`win.pool.$s`) |
@@ -1507,7 +1508,7 @@ statements: surface permissions model service spring prop pose fact event text i
 library: let spring component permissions fact text model service event image figure shader prop pose gesture posture layer translations
 properties.surface: size anchor margin level reserve screens keyboard open kind title rate captures agent
 properties.permissions: run services
-properties.shape: rotate stroke color opacity blend glass lens shine refraction dispersion dome ripple frost smoke milk active show cursor carries grow label agent role value checked selected
+properties.shape: rotate stroke color opacity blend glass lens shine refraction dispersion dome ripple frost smoke milk active show cursor carries grow label agent role value checked selected handle
 properties.ellipse: at radius scale
 properties.box: at from size corner
 properties.arc: at radius span width

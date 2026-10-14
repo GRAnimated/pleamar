@@ -1310,6 +1310,19 @@ pub struct Zone {
     /// What else it says of itself when it is not derived (`role:`, `value:`,
     /// `checked:`, `selected:`). Most zones say none of it.
     pub told: Option<Box<Told>>,
+    /// `handle: i` (`handle: i, left`): the zone is a window's handle, by
+    /// which it is carried (or stretched by that edge). A window that draws
+    /// its own frame and asks to be carried from it gets this zone pressed
+    /// for it, until the button is let go.
+    pub handle: Option<Box<Handle>>,
+}
+
+/// Which window a zone is the handle of, and by which edges (none: it
+/// carries it). The edges are xdg-shell's: 1 top, 2 bottom, 4 left, 8 right.
+#[derive(Clone, Debug)]
+pub struct Handle {
+    pub window: Expr,
+    pub edges: u32,
 }
 
 /// What a zone says of itself for whoever cannot see it.
@@ -2038,7 +2051,7 @@ impl Scene {
         self.zone_under(id, shape, active, vec![])
     }
     pub fn zone_under(&mut self, id: &'static str, shape: Shape, active: impl Into<Expr>, under: Vec<Transform>) -> ZoneId {
-        self.zones.push(Zone { id, shape, active: active.into(), cursor: Cursor::Normal, under, at: self.instrs.len(), zblock: None, carries: None, label: None, reach: Reach::Any, scrolls: None, within: None, told: None });
+        self.zones.push(Zone { id, shape, active: active.into(), cursor: Cursor::Normal, under, at: self.instrs.len(), zblock: None, carries: None, label: None, reach: Reach::Any, scrolls: None, within: None, told: None, handle: None });
         ZoneId(self.zones.len() as u16 - 1)
     }
     /// Claims go from more to less priority; the last one should be
