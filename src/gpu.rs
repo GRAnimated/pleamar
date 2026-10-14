@@ -3018,6 +3018,16 @@ impl Gpu {
         // only what changed now (all of it if it was just made).
         let from_kept = matches!(frame, Frame::Lent(..)) && keeps_canvas && l.kept.is_some();
         let (cuts, copies) = if from_kept { (if kept_fresh { None } else { this_frame }, cuts) } else { (cuts, None) };
+        // A glass that reads what the scene painted under it (`own`) reads it
+        // past its box, as far as its frosting reaches: the piece painted again
+        // grows to all of that, so what it reads is this frame's. Cut to the
+        // piece, `own` kept what an earlier frame had taken there, and the
+        // edges of a glass over glass came out one way in whole frames and
+        // another in partial ones, flickering (issue 48).
+        let cuts = match cuts {
+            Some(c) if with_own && l.own.is_some() => grown_for_glass(c, d, l.view.bounds(), l.scale, l.px),
+            c => c,
+        };
         let view = frame_texture.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
         #[cfg(target_os = "linux")]
@@ -3357,6 +3367,67 @@ const MOST_CUTS: usize = 4;
 /// almost —less than a 64 × 64 square is painted for nothing by joining
 /// them— become one, and while there are more than `MOST_CUTS`, the two that
 /// cost least to join are joined.
+/// The pieces painted again (`[x, y, w, h]`, real pixels of the sheet), each
+/// grown to the whole of every glass it touches and as far as that glass reads
+/// around it (`lens::MARGIN`), until none grows more; and merged where they
+/// meet. `None`: most of the sheet, painted whole.
+///
+/// Before each glass, what has been painted so far is taken (`own`), in the
+/// piece painted again, and the glass reads it (sharp and frosted) past the
+/// piece too, where `own` holds what an earlier frame took, at another point
+/// of the frame. A glass painted again whole, with all it reads, reads only
+/// this frame's. (Growing a piece only by the glasses drawn over the first one
+/// around it was tried, and still flickered.)
+fn grown_for_glass(cuts: Vec<[u32; 4]>, d: &DrawList, view: [f32; 4], scale: f32, px: (u32, u32)) -> Option<Vec<[u32; 4]>> {
+    let m = crate::lens::MARGIN;
+    let (pw, ph) = (px.0 as f32, px.1 as f32);
+    let mut marks: Vec<usize> = d.glass_marks.iter().map(|k| *k as usize).filter(|k| *k < d.element_count()).collect();
+    marks.sort_unstable();
+    marks.dedup();
+    // In the order they are drawn.
+    let reach: Vec<[f32; 4]> = marks
+        .iter()
+        .map(|&k| {
+            let e = &d.elements[k * PER_ELEMENT + 4..k * PER_ELEMENT + 8];
+            [((e[0] - view[0] - m) * scale).floor().max(0.0), ((e[1] - view[1] - m) * scale).floor().max(0.0), ((e[2] - view[0] + m) * scale).ceil().min(pw), ((e[3] - view[1] + m) * scale).ceil().min(ph)]
+        })
+        .filter(|g| g[2] > g[0] && g[3] > g[1])
+        .collect();
+
+    let meet = |a: &[f32; 4], b: &[f32; 4]| a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3];
+    let union = |a: [f32; 4], b: &[f32; 4]| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])];
+    let mut boxes: Vec<[f32; 4]> = cuts.iter().map(|c| [c[0] as f32, c[1] as f32, (c[0] + c[2]) as f32, (c[1] + c[3]) as f32]).collect();
+    // A box that grows may reach another glass, or another box: again, a
+    // few times at most (each time something joins, there is one less).
+    for _ in 0..16 {
+        let mut grew = false;
+        for b in boxes.iter_mut() {
+            for g in &reach {
+                if meet(b, g) && !(g[0] >= b[0] && g[1] >= b[1] && g[2] <= b[2] && g[3] <= b[3]) {
+                    *b = union(*b, g);
+                    grew = true;
+                }
+            }
+        }
+        let mut merged: Vec<[f32; 4]> = Vec::with_capacity(boxes.len());
+        for b in boxes {
+            match merged.iter_mut().find(|o| meet(o, &b)) {
+                Some(o) => {
+                    *o = union(*o, &b);
+                    grew = true;
+                }
+                None => merged.push(b),
+            }
+        }
+        boxes = merged;
+        if !grew {
+            break;
+        }
+    }
+    let area: f32 = boxes.iter().map(|b| (b[2] - b[0]) * (b[3] - b[1])).sum();
+    (area < 0.7 * pw * ph).then(|| boxes.iter().map(|b| [b[0] as u32, b[1] as u32, (b[2] - b[0]) as u32, (b[3] - b[1]) as u32]).collect())
+}
+
 fn merge_cuts(rects: impl Iterator<Item = [f32; 4]>) -> Vec<[f32; 4]> {
     let area = |b: &[f32; 4]| (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0);
     let join = |a: &[f32; 4], b: &[f32; 4]| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])];
