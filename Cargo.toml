@@ -35,6 +35,10 @@ raw-window-handle = "0.6"
 # To ask the card which layouts of a program's memory it can read (dmabuf
 # modifiers): the same ash wgpu speaks Vulkan with.
 ash = "0.38"
+# A card whose Vulkan driver names no layouts paints its monitors through
+# OpenGL (`dmabuf::import_gl`): the same versions wgpu's OpenGL side uses.
+glow = "0.17"
+khronos-egl = { version = "6", features = ["dynamic"] }
 smithay-client-toolkit = "0.21"
 wayland-client = { version = "0.31", features = ["system"] }
 # The protocols every compositor understands: windows and desktops.

@@ -19,6 +19,8 @@ pub const XRGB: u32 = u32::from_le_bytes(*b"XR24");
 /// RGBA in memory (Firefox's and Chromium's tiles).
 pub const ABGR: u32 = u32::from_le_bytes(*b"AB24");
 pub const XBGR: u32 = u32::from_le_bytes(*b"XB24");
+/// `DRM_FORMAT_MOD_INVALID`: a buffer whose layout its driver chose without naming it.
+pub const NO_MODIFIER: u64 = 0x00ff_ffff_ffff_ffff;
 
 /// Whether the render can take buffers in that format: BGRA, RGBA, or NV12
 /// if the card was opened with it.
@@ -555,4 +557,104 @@ unsafe fn plane_counts(instance: &ash::Instance, pd: vk::PhysicalDevice, format:
     // SAFETY: only reading properties.
     unsafe { instance.get_physical_device_format_properties2(pd, format, &mut fp) };
     mods.iter().map(|m| (m.drm_format_modifier, m.drm_format_modifier_plane_count, m.drm_format_modifier_tiling_features)).collect()
+}
+
+/// A buffer on the card (a monitor's, made with GBM) as a texture of a device
+/// that runs on OpenGL: EGL takes the buffer (`EGL_EXT_image_dma_buf_import`)
+/// and a GL texture is bound to it, which wgpu then uses as its own. It is how
+/// a card whose Vulkan driver names no layouts —AMD's GFX6 to GFX8, an RX 580,
+/// until Linux 7.3 and Mesa 26.3— still paints straight into its monitors.
+/// `NO_MODIFIER` (`DRM_FORMAT_MOD_INVALID`): the layout its driver chose
+/// without saying, which EGL is then not told either.
+///
+/// First written by prehonor, for pleamar-wm issue 2.
+pub fn import_gl(device: &wgpu::Device, fd: std::os::fd::OwnedFd, size: (u32, u32), fourcc: u32, modifier: u64, stride: u32, offset: u32) -> Result<wgpu::Texture, String> {
+    use glow::HasContext;
+    use std::os::fd::AsRawFd;
+    const EGL_LINUX_DMA_BUF_EXT: u32 = 0x3270;
+    const EGL_LINUX_DRM_FOURCC_EXT: i32 = 0x3271;
+    const EGL_DMA_BUF_PLANE0_FD_EXT: i32 = 0x3272;
+    const EGL_DMA_BUF_PLANE0_OFFSET_EXT: i32 = 0x3273;
+    const EGL_DMA_BUF_PLANE0_PITCH_EXT: i32 = 0x3274;
+    const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: i32 = 0x3443;
+    const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: i32 = 0x3444;
+    const EGL_WIDTH: i32 = 0x3057;
+    const EGL_HEIGHT: i32 = 0x3056;
+    const EGL_NONE: i32 = 0x3038;
+    type CreateImage = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, u32, *mut std::ffi::c_void, *const i32) -> *mut std::ffi::c_void;
+    type DestroyImage = unsafe extern "system" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> u32;
+    type ImageTargetTexture = unsafe extern "system" fn(u32, *mut std::ffi::c_void);
+
+    // SAFETY: the device is asked for its OpenGL side only to use its own
+    // context, locked (made current) while GL is spoken to.
+    let hal = unsafe { device.as_hal::<wgpu::hal::api::Gles>() }.ok_or("the device does not run on OpenGL")?;
+    let context = hal.context();
+    let egl = context.egl_instance().ok_or("the device has no EGL of its own")?;
+    let display = context.raw_display().ok_or("the device has no EGL display")?.as_ptr();
+    let lookup = |name: &str| egl.get_proc_address(name).map(|f| f as *const ());
+    let create = lookup("eglCreateImageKHR").ok_or("EGL cannot make images (eglCreateImageKHR)")?;
+    let destroy = lookup("eglDestroyImageKHR").ok_or("EGL cannot destroy images (eglDestroyImageKHR)")?;
+    let target = lookup("glEGLImageTargetTexture2DOES").ok_or("GL cannot take an EGL image (glEGLImageTargetTexture2DOES)")?;
+    // SAFETY: the three are what their names say, with these signatures.
+    let (create, destroy, target) = unsafe { (std::mem::transmute::<*const (), CreateImage>(create), std::mem::transmute::<*const (), DestroyImage>(destroy), std::mem::transmute::<*const (), ImageTargetTexture>(target)) };
+    let mut attribs = vec![
+        EGL_WIDTH,
+        size.0 as i32,
+        EGL_HEIGHT,
+        size.1 as i32,
+        EGL_LINUX_DRM_FOURCC_EXT,
+        fourcc as i32,
+        EGL_DMA_BUF_PLANE0_FD_EXT,
+        fd.as_raw_fd(),
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT,
+        offset as i32,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT,
+        stride as i32,
+    ];
+    if modifier != NO_MODIFIER {
+        attribs.extend_from_slice(&[EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, (modifier & 0xffff_ffff) as i32, EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, (modifier >> 32) as i32]);
+    }
+    attribs.push(EGL_NONE);
+    let gl = context.lock();
+    // SAFETY: a display of this context, no context (as the extension asks),
+    // and the attributes above, ended with EGL_NONE. EGL keeps its own hold on
+    // the buffer: the descriptor can be closed after.
+    let image = unsafe { create(display, std::ptr::null_mut(), EGL_LINUX_DMA_BUF_EXT, std::ptr::null_mut(), attribs.as_ptr()) };
+    if image.is_null() {
+        return Err(format!("EGL did not take the buffer ({:?})", egl.get_error()));
+    }
+    // SAFETY: the context is current (locked above); the texture is bound to
+    // the image, which can go once it is (the texture keeps the buffer).
+    let raw = unsafe {
+        let tex = gl.create_texture().map_err(|e| format!("no GL texture: {e}"))?;
+        gl.bind_texture(glow::TEXTURE_2D, Some(tex));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::NEAREST as i32);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+        target(glow::TEXTURE_2D, image);
+        gl.bind_texture(glow::TEXTURE_2D, None);
+        destroy(display, image);
+        tex
+    };
+    drop(gl);
+    let hal_texture = wgpu::hal::gles::Texture {
+        inner: wgpu::hal::gles::TextureInner::Texture { raw, target: glow::TEXTURE_2D },
+        mip_level_count: 1,
+        array_layer_count: 1,
+        format: wgpu::TextureFormat::Bgra8Unorm,
+        format_desc: wgpu::hal::gles::TextureFormatDesc { internal: glow::RGBA8, external: glow::BGRA, data_type: glow::UNSIGNED_BYTE },
+        copy_size: wgpu::hal::CopyExtent { width: size.0, height: size.1, depth: 1 },
+        drop_guard: None,
+    };
+    let desc = wgpu::TextureDescriptor {
+        label: Some("a monitor's buffer, through EGL"),
+        size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Bgra8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    };
+    // SAFETY: a texture of this device's own context, of that size and format.
+    Ok(unsafe { device.create_texture_from_hal::<wgpu::hal::api::Gles>(hal_texture, &desc, wgpu::TextureUses::UNINITIALIZED) })
 }

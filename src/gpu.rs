@@ -1888,6 +1888,9 @@ fn long_ago() -> std::time::Instant {
 }
 
 pub struct Gpu {
+    /// The OpenGL instance, when the card runs on it (see `new`): it has to
+    /// outlive the device.
+    _gl_instance: Option<wgpu::Instance>,
     /// What unmixes and frosts what is behind the glass.
     lens: crate::lens::Pipelines,
     /// For a sheet without a lens: a one-pixel background nobody reads.
@@ -1959,17 +1962,34 @@ impl Gpu {
     /// able to show on it. Without —a monitor driven by the platform itself—,
     /// the card is whatever there is.
     pub fn new(instance: &wgpu::Instance, first: Option<&wgpu::Surface<'static>>) -> Gpu {
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            compatible_surface: first,
-            // `PLEAMAR_GPU=high` asks for the fast card (a laptop's discrete one) instead of the frugal one.
-            power_preference: match std::env::var("PLEAMAR_GPU").as_deref() {
-                Ok("high") => wgpu::PowerPreference::HighPerformance,
-                _ => wgpu::PowerPreference::LowPower,
-            },
-            ..Default::default()
-        }))
-        .expect("there is no graphics adapter");
-        let (device, queue) =
+        // `PLEAMAR_GPU=high` asks for the fast card (a laptop's discrete one) instead of the frugal one.
+        let power_preference = match std::env::var("PLEAMAR_GPU").as_deref() {
+            Ok("high") => wgpu::PowerPreference::HighPerformance,
+            _ => wgpu::PowerPreference::LowPower,
+        };
+        let primary = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions { compatible_surface: first, power_preference, ..Default::default() })).ok();
+        // A compositor (with no surface of its own: it hands its frames to the
+        // monitors itself) has to read other programs' buffers on the card and
+        // paint into its monitors' own; Vulkan does that only with
+        // VK_EXT_image_drm_format_modifier, which AMD's GFX6 to GFX8 cards (an
+        // RX 580) lack until Linux 7.3 and Mesa 26.3. Their OpenGL driver does
+        // it through EGL, so then the compositor runs on OpenGL. Programs keep
+        // Vulkan: they do not need it. `PLEAMAR_BACKEND=gl` forces it,
+        // `PLEAMAR_BACKEND=vulkan` never. (prehonor's idea, pleamar-wm issue 2.)
+        let backend = std::env::var("PLEAMAR_BACKEND").unwrap_or_default();
+        let lacks = primary.as_ref().is_none_or(|a| a.get_info().backend == wgpu::Backend::Vulkan && !a.features().contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF));
+        let gl = first.is_none() && backend != "vulkan" && (backend == "gl" || lacks);
+        // (Its instance is kept with the device: dropped, its context went
+        // with it, and the device was lost before it was made.)
+        let gl_instance = gl.then(|| wgpu::Instance::new(wgpu::InstanceDescriptor { backends: wgpu::Backends::GL, ..wgpu::InstanceDescriptor::new_without_display_handle() }));
+        let gl_adapter = gl_instance.as_ref().and_then(|i| pollster::block_on(i.request_adapter(&wgpu::RequestAdapterOptions { compatible_surface: None, power_preference, ..Default::default() })).ok());
+        if gl && gl_adapter.is_none() {
+            println!("render · OpenGL was asked for, and there is none: Vulkan");
+        }
+        // OpenGL first, if it is wanted; and if its device cannot be made (a
+        // driver that gives an OpenGL without compute shaders, as NVIDIA's
+        // does here), the card as it is, rather than nothing at all.
+        let device_of = |adapter: &wgpu::Adapter| {
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 // By default, wgpu reserves blocks of 128 MB on the card and 64 in
                 // system memory, thinking of a game. A whole scene fits in less
@@ -1982,7 +2002,26 @@ impl Gpu {
                 // Video frames as decoders hand them over (NV12), if the card reads them.
                 required_features: adapter.features() & (wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF | wgpu::Features::TEXTURE_FORMAT_NV12),
                 ..Default::default()
-            })).expect("there is no device");
+            }))
+        };
+        let on_gl = gl_adapter.and_then(|a| match device_of(&a) {
+            Ok(dq) => {
+                println!("render · {}: on OpenGL, through EGL (its Vulkan driver cannot take buffers by their layout)", a.get_info().name);
+                Some((a, dq))
+            }
+            Err(e) => {
+                println!("render · {}: OpenGL could not be used ({e}): Vulkan", a.get_info().name);
+                None
+            }
+        });
+        let (adapter, (device, queue)) = match on_gl {
+            Some(x) => x,
+            None => {
+                let adapter = primary.expect("there is no graphics adapter");
+                let dq = device_of(&adapter).expect("there is no device");
+                (adapter, dq)
+            }
+        };
         let (format, alpha, non_blocking) = match first {
             Some(first) => {
                 let caps = first.get_capabilities(&adapter);
@@ -2071,7 +2110,7 @@ impl Gpu {
         }).create_view(&Default::default());
         let no_backdrop_group = Self::build_backdrop_group(&device, &pipeline, &nothing, &nothing, &sampler);
         #[allow(unused_mut)]
-        let mut g = Gpu { lens, no_backdrop_group, can_copy, own_frames: Default::default(), adapter, device, queue, format, alpha, non_blocking, pipeline, particles, screen, multiply, erase, pipeline_layout, user_code: base, shapes_buffer, elements_buffer, points_buffer, stops_buffer, atlas, atlas_view, windows, windows_view, windows_dims: (1, 1, 1), #[cfg(target_os = "linux")] dmabufs: Default::default(), #[cfg(target_os = "linux")] copies: Default::default(), #[cfg(target_os = "linux")] yuv: None, last_submission: Default::default(), render_modifiers: Vec::new(), sampler, capacity: (INITIAL_SHAPES * PER_SHAPE, INITIAL_ELEMENTS * PER_ELEMENT, INITIAL_POINTS, INITIAL_STOPS), limit, limit_warned: false, scene_group, no_layers_group };
+        let mut g = Gpu { _gl_instance: gl_instance, lens, no_backdrop_group, can_copy, own_frames: Default::default(), adapter, device, queue, format, alpha, non_blocking, pipeline, particles, screen, multiply, erase, pipeline_layout, user_code: base, shapes_buffer, elements_buffer, points_buffer, stops_buffer, atlas, atlas_view, windows, windows_view, windows_dims: (1, 1, 1), #[cfg(target_os = "linux")] dmabufs: Default::default(), #[cfg(target_os = "linux")] copies: Default::default(), #[cfg(target_os = "linux")] yuv: None, last_submission: Default::default(), render_modifiers: Vec::new(), sampler, capacity: (INITIAL_SHAPES * PER_SHAPE, INITIAL_ELEMENTS * PER_ELEMENT, INITIAL_POINTS, INITIAL_STOPS), limit, limit_warned: false, scene_group, no_layers_group };
         #[cfg(target_os = "linux")]
         if first.is_none() {
             g.render_modifiers = g.bgra_modifiers(ash::vk::FormatFeatureFlags::COLOR_ATTACHMENT);
@@ -2714,6 +2753,11 @@ impl Gpu {
     #[allow(clippy::too_many_arguments)]
     pub fn import_dmabuf(device: &wgpu::Device, fd: std::os::fd::OwnedFd, size: (u32, u32), modifier: u64, stride: u32, offset: u32, uses: wgpu::TextureUses, usage: wgpu::TextureUsages, initial: wgpu::TextureUses) -> Result<wgpu::Texture, String> {
         use wgpu::hal::api::Vulkan;
+        // On OpenGL (see `Gpu::new`), a monitor's buffer, through EGL.
+        // SAFETY: only asking which side the device runs on.
+        if unsafe { device.as_hal::<wgpu::hal::api::Gles>() }.is_some() {
+            return crate::dmabuf::import_gl(device, fd, size, crate::dmabuf::XRGB, modifier, stride, offset);
+        }
         let extent = wgpu::Extent3d { width: size.0.max(1), height: size.1.max(1), depth_or_array_layers: 1 };
         let hal_desc = wgpu::hal::TextureDescriptor {
             label: Some("a buffer on the card"),
