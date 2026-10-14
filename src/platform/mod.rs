@@ -750,6 +750,12 @@ pub trait PlatformWindow: Send {
     fn desktop_place(&self) -> Option<(String, (i32, i32))> {
         None
     }
+    /// Frames of our own to paint it in, where the platform can hand them to
+    /// the compositor itself, with what changed in each: a swapchain tells it
+    /// all changed. `None`, the swapchain.
+    fn own_frames(&self) -> Option<Box<dyn crate::gpu::Frames>> {
+        None
+    }
 }
 
 /// A capture of what was seen on screen in a box of a window.

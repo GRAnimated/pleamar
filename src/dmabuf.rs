@@ -398,3 +398,161 @@ pub fn modifiers(adapter: &wgpu::Adapter, format: vk::Format, need: vk::FormatFe
         mods.iter().filter(|m| m.drm_format_modifier_tiling_features.contains(need)).map(|m| m.drm_format_modifier).collect()
     }
 }
+
+/// A frame of our own on the card, to hand to the compositor as a dmabuf:
+/// the texture painted in, and how the compositor reads its memory.
+pub struct Exported {
+    pub texture: wgpu::Texture,
+    pub fd: std::os::fd::OwnedFd,
+    pub modifier: u64,
+    /// Each plane's offset and stride, in bytes: one, for the layouts asked for.
+    pub planes: Vec<(u32, u32)>,
+}
+
+/// A BGRA texture of that size the card paints in and the compositor reads
+/// (ARGB8888 to it), in one of `modifiers`. Only layouts of one plane are
+/// asked for: those with the compression data beside it (AMD's DCC, Intel's
+/// CCS) need the image handed over to the other process with a barrier wgpu
+/// does not make, and a frame cleared to transparent could come out garbled.
+pub fn export(device: &wgpu::Device, size: (u32, u32), modifiers: &[u64]) -> Result<Exported, String> {
+    let extent = wgpu::Extent3d { width: size.0.max(1), height: size.1.max(1), depth_or_array_layers: 1 };
+    let uses = wgpu::TextureUses::COLOR_TARGET | wgpu::TextureUses::COPY_DST;
+    let hal_desc = wgpu::hal::TextureDescriptor {
+        label: Some("a frame of ours"),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Bgra8Unorm,
+        usage: uses,
+        memory_flags: wgpu::hal::MemoryFlags::empty(),
+        view_formats: Vec::new(),
+    };
+    // SAFETY: an image made here, with memory made for it; both handed to
+    // wgpu, which frees them (the callback) once nothing uses them.
+    let (hal_texture, fd, modifier, planes) = unsafe {
+        let hal = device.as_hal::<Vulkan>().ok_or("the card is not driven with Vulkan")?;
+        let (image, memory, fd, modifier, planes) = export_image(&hal, extent, modifiers)?;
+        let raw = hal.raw_device().clone();
+        let free: wgpu::hal::DropCallback = Box::new(move || {
+            raw.destroy_image(image, None);
+            raw.free_memory(memory, None);
+        });
+        (hal.texture_from_raw(image, &hal_desc, Some(free), wgpu::hal::vulkan::TextureMemory::External), fd, modifier, planes)
+    };
+    let desc = wgpu::TextureDescriptor {
+        label: Some("a frame of ours"),
+        size: extent,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Bgra8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    };
+    // SAFETY: made on this device, as `desc` says.
+    let texture = unsafe { device.create_texture_from_hal::<Vulkan>(hal_texture, &desc, wgpu::TextureUses::UNINITIALIZED) };
+    Ok(Exported { texture, fd, modifier, planes })
+}
+
+/// The image, its memory, the memory as a dmabuf, the layout the card chose
+/// and its planes.
+type ExportedImage = (vk::Image, vk::DeviceMemory, std::os::fd::OwnedFd, u64, Vec<(u32, u32)>);
+
+unsafe fn export_image(hal: &wgpu::hal::vulkan::Device, extent: wgpu::Extent3d, modifiers: &[u64]) -> Result<ExportedImage, String> {
+    use std::os::fd::FromRawFd;
+    let raw = hal.raw_device();
+    let instance = hal.shared_instance().raw_instance();
+    let pd = hal.raw_physical_device();
+    // Of the layouts the compositor reads, those the card paints in, of one plane.
+    let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST;
+    // SAFETY: only reading the physical device's properties.
+    let one_plane: Vec<u64> = unsafe { plane_counts(instance, pd, vk::Format::B8G8R8A8_UNORM) }
+        .into_iter()
+        .filter(|(m, planes, features)| *planes == 1 && features.contains(vk::FormatFeatureFlags::COLOR_ATTACHMENT | vk::FormatFeatureFlags::TRANSFER_DST) && modifiers.contains(m))
+        .map(|(m, _, _)| m)
+        .collect();
+    if one_plane.is_empty() {
+        return Err("the compositor reads no layout of one plane the card paints in".into());
+    }
+    let mut list = vk::ImageDrmFormatModifierListCreateInfoEXT::default().drm_format_modifiers(&one_plane);
+    let mut external = vk::ExternalMemoryImageCreateInfo::default().handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(vk::Format::B8G8R8A8_UNORM)
+        .extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+        .usage(usage)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+        .initial_layout(vk::ImageLayout::UNDEFINED)
+        .push_next(&mut external)
+        .push_next(&mut list);
+    // SAFETY: a valid create info for this device.
+    let image = unsafe { raw.create_image(&info, None) }.map_err(|e| format!("the card made no frame in those layouts: {e}"))?;
+    let fail = |memory: Option<vk::DeviceMemory>, e: String| {
+        // SAFETY: made here and not handed to anyone.
+        unsafe {
+            if let Some(m) = memory {
+                raw.free_memory(m, None);
+            }
+            raw.destroy_image(image, None);
+        }
+        Err(e)
+    };
+    let modifier_fn = ash::ext::image_drm_format_modifier::Device::new(instance, raw);
+    let mut chosen = vk::ImageDrmFormatModifierPropertiesEXT::default();
+    // SAFETY: an image made with a list of modifiers.
+    if let Err(e) = unsafe { modifier_fn.get_image_drm_format_modifier_properties(image, &mut chosen) } {
+        return fail(None, format!("the card did not say which layout it chose: {e}"));
+    }
+    // SAFETY: the image was just made on this device.
+    let req = unsafe { raw.get_image_memory_requirements(image) };
+    // SAFETY: only reading the physical device's properties.
+    let kinds = unsafe { instance.get_physical_device_memory_properties(pd) };
+    let fits = |k: u32| req.memory_type_bits & (1 << k) != 0;
+    let local = (0..kinds.memory_type_count).find(|k| fits(*k) && kinds.memory_types[*k as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL));
+    let Some(kind) = local.or_else(|| (0..kinds.memory_type_count).find(|k| fits(*k))) else {
+        return fail(None, "no kind of the card's memory fits the frame".into());
+    };
+    let mut export = vk::ExportMemoryAllocateInfo::default().handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+    let mut one = vk::MemoryDedicatedAllocateInfo::default().image(image);
+    let alloc = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(kind).push_next(&mut export).push_next(&mut one);
+    // SAFETY: a valid allocation, dedicated to the image.
+    let memory = match unsafe { raw.allocate_memory(&alloc, None) } {
+        Ok(m) => m,
+        Err(e) => return fail(None, format!("no memory for the frame: {e}")),
+    };
+    // SAFETY: memory made for this image.
+    if let Err(e) = unsafe { raw.bind_image_memory(image, memory, 0) } {
+        return fail(Some(memory), format!("the frame's memory could not be bound: {e}"));
+    }
+    let fd_fn = ash::khr::external_memory_fd::Device::new(instance, raw);
+    // SAFETY: memory allocated to be exported as a dmabuf.
+    let fd = match unsafe { fd_fn.get_memory_fd(&vk::MemoryGetFdInfoKHR::default().memory(memory).handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)) } {
+        // SAFETY: a new fd, ours.
+        Ok(fd) => unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
+        Err(e) => return fail(Some(memory), format!("the frame could not be shared: {e}")),
+    };
+    // SAFETY: an image with a modifier of one plane.
+    let layout = unsafe { raw.get_image_subresource_layout(image, vk::ImageSubresource { aspect_mask: vk::ImageAspectFlags::MEMORY_PLANE_0_EXT, mip_level: 0, array_layer: 0 }) };
+    Ok((image, memory, fd, chosen.drm_format_modifier, vec![(layout.offset as u32, layout.row_pitch as u32)]))
+}
+
+/// Each layout the card knows for that format: its modifier, how many
+/// planes it has and what can be done with it.
+unsafe fn plane_counts(instance: &ash::Instance, pd: vk::PhysicalDevice, format: vk::Format) -> Vec<(u64, u32, vk::FormatFeatureFlags)> {
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+    let mut fp = vk::FormatProperties2::default().push_next(&mut list);
+    // SAFETY: only reading properties.
+    unsafe { instance.get_physical_device_format_properties2(pd, format, &mut fp) };
+    let n = list.drm_format_modifier_count as usize;
+    let mut mods = vec![vk::DrmFormatModifierPropertiesEXT::default(); n];
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default().drm_format_modifier_properties(&mut mods);
+    let mut fp = vk::FormatProperties2::default().push_next(&mut list);
+    // SAFETY: only reading properties.
+    unsafe { instance.get_physical_device_format_properties2(pd, format, &mut fp) };
+    mods.iter().map(|m| (m.drm_format_modifier, m.drm_format_modifier_plane_count, m.drm_format_modifier_tiling_features)).collect()
+}

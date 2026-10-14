@@ -52,6 +52,208 @@ static BACKGROUND_EFFECTS: std::sync::OnceLock<ExtBackgroundEffectManagerV1> = s
 
 use wayland_protocols_wlr::screencopy::v1::client::{zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1}, zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1};
 use wayland_client::protocol::{wl_buffer::WlBuffer, wl_shm::{self, WlShm}, wl_shm_pool::WlShmPool};
+use smithay_client_toolkit::reexports::protocols::wp::linux_dmabuf::zv1::client::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1::{self, ZwpLinuxDmabufV1}};
+
+/// Whoever takes frames on the card from us (`linux-dmabuf`): with it a
+/// surface is painted in frames of its own, and the compositor is told
+/// which piece of each changed. And the layouts it reads ARGB8888 in.
+struct Dmabufs {
+    global: ZwpLinuxDmabufV1,
+    qh: QueueHandle<State>,
+    connection: Connection,
+}
+static DMABUFS: std::sync::OnceLock<Dmabufs> = std::sync::OnceLock::new();
+static ARGB_LAYOUTS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// Version 3 says each format and layout it reads, one by one.
+struct Layouts;
+impl Dispatch2<ZwpLinuxDmabufV1, State> for Layouts {
+    fn event(&self, _: &mut State, _: &ZwpLinuxDmabufV1, ev: zwp_linux_dmabuf_v1::Event, _: &Connection, _: &QueueHandle<State>) {
+        if let zwp_linux_dmabuf_v1::Event::Modifier { format, modifier_hi, modifier_lo } = ev {
+            let m = ((modifier_hi as u64) << 32) | modifier_lo as u64;
+            let mut all = ARGB_LAYOUTS.lock().unwrap();
+            if format == crate::dmabuf::ARGB && !all.contains(&m) {
+                all.push(m);
+            }
+        }
+    }
+}
+
+/// A frame of ours the compositor has stopped reading: it can be painted in again.
+struct Released(Arc<std::sync::atomic::AtomicBool>);
+impl Dispatch2<WlBuffer, State> for Released {
+    fn event(&self, _: &mut State, _: &WlBuffer, ev: wayland_client::protocol::wl_buffer::Event, _: &Connection, _: &QueueHandle<State>) {
+        if let wayland_client::protocol::wl_buffer::Event::Release = ev {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+}
+
+/// A surface's frames, ours: three, painted in turn —the one on screen, one
+/// on its way, one to paint—. Each is handed over once the card has painted
+/// it, with only the pieces that changed damaged, from a thread of its own so
+/// the render does not wait for the card.
+struct OwnFrames {
+    wl: wl_surface::WlSurface,
+    px: (u32, u32),
+    frames: Vec<OwnFrame>,
+    latest: Option<usize>,
+    failed: bool,
+    to_show: Option<Sender<Show>>,
+}
+
+struct OwnFrame {
+    texture: wgpu::Texture,
+    buffer: WlBuffer,
+    /// On screen or on its way there: not to be painted in.
+    busy: Arc<std::sync::atomic::AtomicBool>,
+    _fd: std::os::fd::OwnedFd,
+}
+
+enum Show {
+    /// That one, once the card has painted it: those pieces changed (`None`, all).
+    Frame { buffer: WlBuffer, px: (u32, u32), pieces: Option<Vec<[u32; 4]>>, sent: gpu::Sent },
+    /// These are not used any more: after whatever was asked before.
+    Forget(Vec<WlBuffer>),
+    /// Say so once everything asked before has reached the compositor.
+    Settled(std::sync::mpsc::Sender<()>),
+}
+
+const OWN_FRAMES: usize = 3;
+
+impl OwnFrames {
+    fn forget(&mut self) {
+        let buffers: Vec<WlBuffer> = self.frames.drain(..).map(|f| f.buffer).collect();
+        self.latest = None;
+        if buffers.is_empty() {
+            return;
+        }
+        match &self.to_show {
+            Some(tx) => {
+                let _ = tx.send(Show::Forget(buffers));
+            }
+            None => buffers.iter().for_each(|b| b.destroy()),
+        }
+    }
+
+    fn make(&mut self, device: &wgpu::Device) -> Result<(), String> {
+        let d = DMABUFS.get().ok_or("the compositor takes no frames on the card")?;
+        let layouts = ARGB_LAYOUTS.lock().unwrap().clone();
+        for _ in 0..OWN_FRAMES {
+            let e = crate::dmabuf::export(device, self.px, &layouts)?;
+            let params = d.global.create_params(&d.qh, Silent);
+            for (k, (offset, stride)) in e.planes.iter().enumerate() {
+                params.add(std::os::fd::AsFd::as_fd(&e.fd), k as u32, *offset, *stride, (e.modifier >> 32) as u32, e.modifier as u32);
+            }
+            let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let buffer = params.create_immed(self.px.0 as i32, self.px.1 as i32, crate::dmabuf::ARGB, zwp_linux_buffer_params_v1::Flags::empty(), &d.qh, Released(busy.clone()));
+            params.destroy();
+            self.frames.push(OwnFrame { texture: e.texture, buffer, busy, _fd: e.fd });
+        }
+        let _ = d.connection.flush();
+        println!("render · {} frames of our own of {}×{} handed to the compositor, with what changed in each", self.frames.len(), self.px.0, self.px.1);
+        Ok(())
+    }
+}
+
+impl gpu::Frames for OwnFrames {
+    fn acquire(&mut self, device: &wgpu::Device, _modifiers: &[u64]) -> Option<(usize, wgpu::Texture)> {
+        if self.failed {
+            return None;
+        }
+        if self.frames.is_empty()
+            && let Err(e) = self.make(device)
+        {
+            println!("render · no frames of our own ({e}): the system's swapchain, which tells the compositor all of it changed each time");
+            self.forget();
+            self.failed = true;
+            return None;
+        }
+        // Not the one just handed over, which may not be on screen yet.
+        let free = |k: &usize| !self.frames[*k].busy.load(Ordering::Acquire);
+        let k = (0..self.frames.len()).filter(|k| Some(*k) != self.latest).find(free)?;
+        Some((k, self.frames[k].texture.clone()))
+    }
+
+    fn present(&mut self, which: usize, done: wgpu::SubmissionIndex, device: &wgpu::Device, queue: &wgpu::Queue, changed: Option<[u32; 4]>) {
+        self.present_pieces(which, done, device, queue, changed.map(|c| vec![c]).as_deref());
+    }
+
+    fn present_pieces(&mut self, which: usize, _done: wgpu::SubmissionIndex, device: &wgpu::Device, queue: &wgpu::Queue, pieces: Option<&[[u32; 4]]>) {
+        let Some(f) = self.frames.get(which) else { return };
+        f.busy.store(true, Ordering::Release);
+        self.latest = Some(which);
+        let tx = self.to_show.get_or_insert_with(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<Show>();
+            let (wl, device) = (self.wl.clone(), device.clone());
+            let connection = DMABUFS.get().map(|d| d.connection.clone());
+            let _ = std::thread::Builder::new().name("frames shown".into()).spawn(move || {
+                for job in rx {
+                    match job {
+                        Show::Frame { buffer, px, pieces, sent } => {
+                            // The compositor reads it as it is: not before the card has finished it.
+                            sent.wait(&device, std::time::Duration::from_secs(1));
+                            wl.attach(Some(&buffer), 0, 0);
+                            match pieces {
+                                None => wl.damage_buffer(0, 0, px.0 as i32, px.1 as i32),
+                                Some(p) => {
+                                    for [x, y, w, h] in p.into_iter().filter(|b| b[2] > 0 && b[3] > 0) {
+                                        wl.damage_buffer(x as i32, y as i32, w as i32, h as i32);
+                                    }
+                                }
+                            }
+                            wl.commit();
+                        }
+                        Show::Forget(buffers) => buffers.iter().for_each(|b| b.destroy()),
+                        Show::Settled(done) => {
+                            if let Some(c) = &connection {
+                                let _ = c.flush();
+                            }
+                            let _ = done.send(());
+                        }
+                    }
+                    if let Some(c) = &connection {
+                        let _ = c.flush();
+                    }
+                }
+            });
+            tx
+        });
+        let _ = tx.send(Show::Frame { buffer: f.buffer.clone(), px: self.px, pieces: pieces.map(|p| p.to_vec()), sent: gpu::Sent::after(queue) });
+    }
+
+    fn whole_screen(&self) -> bool {
+        false
+    }
+
+    /// A glass's capture of what is behind is asked for right after a frame:
+    /// asked before the frame reached the compositor, it showed the one
+    /// before, and the lens unmixed the wrong picture.
+    fn settle(&mut self) {
+        let Some(tx) = &self.to_show else { return };
+        let (done, wait) = std::sync::mpsc::channel();
+        if tx.send(Show::Settled(done)).is_ok() {
+            let _ = wait.recv_timeout(std::time::Duration::from_secs(1));
+        }
+    }
+
+    fn resize(&mut self, px: (u32, u32)) {
+        if px != self.px {
+            self.forget();
+            self.px = px;
+        }
+    }
+
+    fn gave_up(&self) -> bool {
+        self.failed
+    }
+}
+
+impl Drop for OwnFrames {
+    fn drop(&mut self) {
+        self.forget();
+    }
+}
 
 /// Whoever photographs the screen (`wlr-screencopy`), and the shared memory
 /// where it leaves the capture. With both, pleamar can see what's behind it.
@@ -361,6 +563,10 @@ impl PlatformWindow for WaylandWindow {
     /// the input region: the notice arrives when the compositor wants another one.
     fn request_frame(&self) {
         self.wl.frame(&self.qh, FrameFor(self.id));
+    }
+
+    fn own_frames(&self) -> Option<Box<dyn gpu::Frames>> {
+        (DMABUFS.get().is_some() && !ARGB_LAYOUTS.lock().unwrap().is_empty()).then(|| Box::new(OwnFrames { wl: self.wl.clone(), px: (0, 0), frames: Vec::new(), latest: None, failed: false, to_show: None }) as Box<dyn gpu::Frames>)
     }
 
     fn desktop_place(&self) -> Option<(String, (i32, i32))> {
@@ -1226,6 +1432,9 @@ pub fn run_event_loop(wanted: Vec<Surface>, extra_height: u32, instance: wgpu::I
     }
     if let Ok(m) = globals.bind::<ExtBackgroundEffectManagerV1, _, _>(&qh, 1..=1, Silent) {
         let _ = BACKGROUND_EFFECTS.set(m);
+    }
+    if let Ok(global) = globals.bind::<ZwpLinuxDmabufV1, _, _>(&qh, 3..=3, Layouts) {
+        let _ = DMABUFS.set(Dmabufs { global, qh: qh.clone(), connection: connection.clone() });
     }
     if let (Ok(c), Ok(s)) = (globals.bind::<ZwlrScreencopyManagerV1, _, _>(&qh, 1..=3, Silent), globals.bind::<WlShm, _, _>(&qh, 1..=1, Silent)) {
         let _ = SCREENCOPY.set((c, s));

@@ -1712,6 +1712,36 @@ pub trait Frames: Send {
     /// `changed`: the piece of it that may differ from the frame presented
     /// before, in its pixels (x, y, w, h); none if all of it may.
     fn present(&mut self, which: usize, done: wgpu::SubmissionIndex, device: &wgpu::Device, queue: &wgpu::Queue, changed: Option<[u32; 4]>);
+    /// The same, told each piece that may differ instead of one box round
+    /// them all: a bar lit at one end and at the other is not the whole screen.
+    fn present_pieces(&mut self, which: usize, done: wgpu::SubmissionIndex, device: &wgpu::Device, queue: &wgpu::Queue, pieces: Option<&[[u32; 4]]>) {
+        let round = pieces.map(|c| {
+            c.iter().fold(None, |u: Option<[u32; 4]>, b| {
+                Some(u.map_or(*b, |u| {
+                    let (x0, y0) = (u[0].min(b[0]), u[1].min(b[1]));
+                    [x0, y0, (u[0] + u[2]).max(b[0] + b[2]) - x0, (u[1] + u[3]).max(b[1] + b[3]) - y0]
+                }))
+            }).unwrap_or([0, 0, 0, 0])
+        });
+        self.present(which, done, device, queue, round);
+    }
+    /// Whether these frames are a whole monitor of the platform's own
+    /// (pleamar-wm): nothing is behind them but what was painted before. A
+    /// surface handed to another compositor has its desktop behind.
+    fn whole_screen(&self) -> bool {
+        true
+    }
+    /// The surface measures that many pixels now: frames of that size from here on.
+    fn resize(&mut self, _px: (u32, u32)) {}
+    /// Until the frame presented last has reached the platform: what is
+    /// asked of it after —a capture of the screen with that frame on it—
+    /// comes after it.
+    fn settle(&mut self) {}
+    /// They cannot be made (the card or the compositor refused them): the
+    /// surface goes back to the system's swapchain.
+    fn gave_up(&self) -> bool {
+        false
+    }
 }
 
 /// What the platform hands the render thread for each surface.
@@ -1793,6 +1823,9 @@ pub struct Sheet {
     pub cleared: bool,
     pub view: View,
     target: Target,
+    /// A surface painted in frames of our own keeps the system's swapchain
+    /// unused, to go back to if those cannot be made.
+    spare: Option<wgpu::Surface<'static>>,
     window: Box<dyn PlatformWindow>,
     px: (u32, u32),
     uniforms: wgpu::Buffer,
@@ -1861,6 +1894,9 @@ pub struct Gpu {
     no_backdrop_group: wgpu::BindGroup,
     /// Whether the screen accepts having a canvas copied to it: without that, there is no lens.
     can_copy: bool,
+    /// Some surface is painted in frames of our own: presenting never waits,
+    /// so the render sets the pace as with mailbox.
+    own_frames: std::cell::Cell<bool>,
     adapter: wgpu::Adapter,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -2035,7 +2071,7 @@ impl Gpu {
         }).create_view(&Default::default());
         let no_backdrop_group = Self::build_backdrop_group(&device, &pipeline, &nothing, &nothing, &sampler);
         #[allow(unused_mut)]
-        let mut g = Gpu { lens, no_backdrop_group, can_copy, adapter, device, queue, format, alpha, non_blocking, pipeline, particles, screen, multiply, erase, pipeline_layout, user_code: base, shapes_buffer, elements_buffer, points_buffer, stops_buffer, atlas, atlas_view, windows, windows_view, windows_dims: (1, 1, 1), #[cfg(target_os = "linux")] dmabufs: Default::default(), #[cfg(target_os = "linux")] copies: Default::default(), #[cfg(target_os = "linux")] yuv: None, last_submission: Default::default(), render_modifiers: Vec::new(), sampler, capacity: (INITIAL_SHAPES * PER_SHAPE, INITIAL_ELEMENTS * PER_ELEMENT, INITIAL_POINTS, INITIAL_STOPS), limit, limit_warned: false, scene_group, no_layers_group };
+        let mut g = Gpu { lens, no_backdrop_group, can_copy, own_frames: Default::default(), adapter, device, queue, format, alpha, non_blocking, pipeline, particles, screen, multiply, erase, pipeline_layout, user_code: base, shapes_buffer, elements_buffer, points_buffer, stops_buffer, atlas, atlas_view, windows, windows_view, windows_dims: (1, 1, 1), #[cfg(target_os = "linux")] dmabufs: Default::default(), #[cfg(target_os = "linux")] copies: Default::default(), #[cfg(target_os = "linux")] yuv: None, last_submission: Default::default(), render_modifiers: Vec::new(), sampler, capacity: (INITIAL_SHAPES * PER_SHAPE, INITIAL_ELEMENTS * PER_ELEMENT, INITIAL_POINTS, INITIAL_STOPS), limit, limit_warned: false, scene_group, no_layers_group };
         #[cfg(target_os = "linux")]
         if first.is_none() {
             g.render_modifiers = g.bgra_modifiers(ash::vk::FormatFeatureFlags::COLOR_ATTACHMENT);
@@ -2221,7 +2257,7 @@ impl Gpu {
     }
 
     pub fn uses_mailbox(&self) -> bool {
-        self.non_blocking == Some(wgpu::PresentMode::Mailbox) && std::env::var_os("PLEAMAR_FIFO").is_none()
+        (self.non_blocking == Some(wgpu::PresentMode::Mailbox) || self.own_frames.get()) && std::env::var_os("PLEAMAR_FIFO").is_none()
     }
 
     /// What was written and then not painted, to the card all the same: a write
@@ -2289,8 +2325,24 @@ impl Gpu {
         let (layer_views, layer_group) = Self::make_layers(&self.device, &self.pipeline, self.format, 1, 1, 1);
         let mut l = Sheet {
             id: n.id, frame_no: 0, painted_as: Vec::new(), damage_log: Default::default(), known_as: (0, (0, 0)), kept: None, idle_kept_frames: 0, name: n.name, mhz: n.mhz, scale: n.scale, drives_pace: true, open: true, cleared: false, view: n.view,
-            target: n.target, window: n.window, px: (0, 0), uniforms, uniform_group, layer_views, layer_group, layers: 0, idle_layer_frames: 0, blur_rects: Vec::new(), lens: None, own: None, idle_own_frames: 0, wants_lens: false, capture: BackdropCapture::Idle, glass_box: None, asked_box: [0; 4], capture_asked: std::time::Instant::now(), capture_taken: long_ago(), owed_damage: Vec::new(), painted_now: false, painted: None, input_region: vec![[-1, -1, -1, -1]], presented: false, keyboard_mode: None,
+            target: n.target, spare: None, window: n.window, px: (0, 0), uniforms, uniform_group, layer_views, layer_group, layers: 0, idle_layer_frames: 0, blur_rects: Vec::new(), lens: None, own: None, idle_own_frames: 0, wants_lens: false, capture: BackdropCapture::Idle, glass_box: None, asked_box: [0; 4], capture_asked: std::time::Instant::now(), capture_taken: long_ago(), owed_damage: Vec::new(), painted_now: false, painted: None, input_region: vec![[-1, -1, -1, -1]], presented: false, keyboard_mode: None,
         };
+        // Frames of our own where the platform makes them, so the compositor
+        // is told which piece of each changed: a swapchain's are handed over
+        // whole, and a bar the size of the screen made it compose and blur all
+        // of it for one button lit (#46). They are painted as the scene's
+        // pipelines paint, BGRA with premultiplied alpha; `PLEAMAR_SWAPCHAIN=1`
+        // keeps the swapchain, to compare.
+        let ours = self.format == wgpu::TextureFormat::Bgra8Unorm && self.alpha == wgpu::CompositeAlphaMode::PreMultiplied && std::env::var_os("PLEAMAR_SWAPCHAIN").is_none();
+        if ours
+            && matches!(l.target, Target::Surface(_))
+            && let Some(frames) = l.window.own_frames()
+        {
+            if let Target::Surface(s) = std::mem::replace(&mut l.target, Target::Frames(frames)) {
+                l.spare = Some(s);
+            }
+            self.own_frames.set(true);
+        }
         self.reconfigure(&mut l, size);
         l
     }
@@ -2335,9 +2387,12 @@ impl Gpu {
         }
     }
 
-    fn configure_surface(&self, l: &Sheet, px: (u32, u32)) {
+    fn configure_surface(&self, l: &mut Sheet, px: (u32, u32)) {
         let _ = &self.adapter;
-        let Target::Surface(surface) = &l.target else { return };
+        let surface = match &mut l.target {
+            Target::Surface(s) => s,
+            Target::Frames(frames) => return frames.resize(px),
+        };
         surface.configure(
             &self.device,
             &wgpu::SurfaceConfiguration {
@@ -2757,7 +2812,7 @@ impl Gpu {
         // The lens, if it shows glass and the screen lets a canvas be copied onto it.
         // A monitor of pleamar-wm's own has nothing behind it to capture: what
         // is behind its glass is what it painted itself before it.
-        let whole_screen = matches!(l.target, Target::Frames(_));
+        let whole_screen = matches!(&l.target, Target::Frames(f) if f.whole_screen());
         if !l.wants_lens || !self.can_copy || whole_screen {
             l.lens = None;
         } else if l.lens.is_none() {
@@ -2810,6 +2865,14 @@ impl Gpu {
             },
             Target::Frames(frames) => match frames.acquire(&self.device, &self.render_modifiers) {
                 Some((which, texture)) => Frame::Lent(which, texture),
+                // Our own frames could not be made: back to the swapchain, from the next round.
+                None if frames.gave_up() => {
+                    if let Some(s) = l.spare.take() {
+                        l.target = Target::Surface(s);
+                        self.configure_surface(l, l.px);
+                    }
+                    return false;
+                }
                 None => return false,
             },
         };
@@ -2822,30 +2885,34 @@ impl Gpu {
         // the canvas is copied whole to the screen —a copy costs the card far
         // less than painting a glass the size of the monitor—. Given back
         // after a while of everything changing at once.
+        // Frames of our own handed to a compositor are three: painting in
+        // each what changed since it was last painted repainted what changed
+        // in the last three frames. They are brought up to date from the kept
+        // canvas instead, by copies of those pieces.
         let full_repaint = std::env::var_os("PLEAMAR_FULL_REPAINT").is_some();
-        let surface_only = matches!(frame, Frame::Surface(_)) && l.lens.is_none();
-        if surface_only && self.can_copy && damage.is_some() && l.open && !full_repaint {
+        let keeps_canvas = (matches!(frame, Frame::Surface(_)) || !whole_screen) && l.lens.is_none();
+        let mut kept_fresh = false;
+        if keeps_canvas && self.can_copy && damage.is_some() && l.open && !full_repaint {
             l.idle_kept_frames = 0;
             if l.kept.is_none() {
                 l.kept = Some(crate::lens::texture(&self.device, "kept", l.px, self.format, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC));
                 l.painted_as.clear();
                 l.damage_log.clear();
+                kept_fresh = true;
             }
         } else if l.kept.is_some() {
             l.idle_kept_frames += 1;
-            if !surface_only || l.idle_kept_frames > IDLE_KEPT_FRAMES {
+            if !keeps_canvas || l.idle_kept_frames > IDLE_KEPT_FRAMES {
                 l.kept = None;
             }
         }
         // Which canvas this frame goes on, if what it holds is known: one
         // the platform lends, one of the lens's two, or the kept one.
-        let known: Option<(u8, usize)> = match &frame {
-            Frame::Lent(which, _) => Some((1, *which)),
-            Frame::Surface(_) => match (&l.lens, &l.kept) {
-                (Some(lens), _) => Some((2, lens.next())),
-                (None, Some(_)) => Some((3, 0)),
-                (None, None) => None,
-            },
+        let known: Option<(u8, usize)> = match (&frame, &l.lens, &l.kept) {
+            (_, Some(lens), _) => Some((2, lens.next())),
+            (Frame::Lent(which, _), None, _) => Some((1, *which)),
+            (Frame::Surface(_), None, Some(_)) => Some((3, 0)),
+            (Frame::Surface(_), None, None) => None,
         };
         if known.map(|k| (k.0, l.px)) != Some(l.known_as) {
             l.painted_as.clear();
@@ -2856,6 +2923,8 @@ impl Gpu {
         // since that canvas was last painted— in pixels: a few boxes, not
         // one around them all, which for a bar round the edge of the screen
         // that lights up at one end and at the other is the whole screen.
+        // And what changed in this frame alone, the same way (`None`, all of it).
+        let mut this_frame: Option<Vec<[u32; 4]>> = None;
         let cuts: Option<Vec<[u32; 4]>> = match known {
             None => None,
             // `PLEAMAR_FULL_REPAINT=1`: every frame whole, to compare.
@@ -2875,6 +2944,8 @@ impl Gpu {
                         [((b[0] - v[0]) * l.scale).floor().max(0.0), ((b[1] - v[1]) * l.scale).floor().max(0.0), ((b[2] - v[0]) * l.scale).ceil().min(pw), ((b[3] - v[1]) * l.scale).ceil().min(ph)]
                     }))
                 });
+                let as_px = |r: &Vec<[f32; 4]>| (r.iter().map(|b| (b[2] - b[0]) * (b[3] - b[1])).sum::<f32>() < 0.7 * pw * ph).then(|| r.iter().map(|b| [b[0] as u32, b[1] as u32, (b[2] - b[0]) as u32, (b[3] - b[1]) as u32]).collect());
+                this_frame = now.as_ref().and_then(as_px);
                 let frame_no = l.frame_no;
                 l.frame_no += 1;
                 if l.painted_as.len() <= which {
@@ -2896,21 +2967,13 @@ impl Gpu {
                     complete.then(|| merge_cuts(all.into_iter()))
                 });
                 // Most of it changed: it is painted whole, in one go.
-                region.filter(|r| r.iter().map(|b| (b[2] - b[0]) * (b[3] - b[1])).sum::<f32>() < 0.7 * pw * ph).map(|r| {
-                    r.iter().map(|b| [b[0] as u32, b[1] as u32, (b[2] - b[0]) as u32, (b[3] - b[1]) as u32]).collect()
-                })
+                region.as_ref().and_then(as_px)
             }
         };
-        // The box round them all: what the compositor is told changed.
-        // Nothing changed for this canvas: it is shown as it is.
-        let scissor: Option<[u32; 4]> = cuts.as_ref().map(|c| {
-            c.iter().fold(None, |u: Option<[u32; 4]>, b| {
-                Some(u.map_or(*b, |u| {
-                    let (x0, y0) = (u[0].min(b[0]), u[1].min(b[1]));
-                    [x0, y0, (u[0] + u[2]).max(b[0] + b[2]) - x0, (u[1] + u[3]).max(b[1] + b[3]) - y0]
-                }))
-            }).unwrap_or([0, 0, 0, 0])
-        });
+        // Our own frame brought up to date from the kept canvas: on that one,
+        // only what changed now (all of it if it was just made).
+        let from_kept = matches!(frame, Frame::Lent(..)) && keeps_canvas && l.kept.is_some();
+        let (cuts, copies) = if from_kept { (if kept_fresh { None } else { this_frame }, cuts) } else { (cuts, None) };
         let view = frame_texture.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
         #[cfg(target_os = "linux")]
@@ -2994,7 +3057,7 @@ impl Gpu {
             // With a lens, on its canvas, which is then copied to the screen: one
             // has to know exactly what was painted to unmix what is behind.
             (Some(lens), _) => lens.canvas(),
-            (None, Some(kept)) if surface_only => &kept.1,
+            (None, Some(kept)) if keeps_canvas => &kept.1,
             _ => &view,
         };
         // Closed, it is cleared: transparent and nothing on top. Painting what
@@ -3155,9 +3218,25 @@ impl Gpu {
         }
         if let Some(lens) = &mut l.lens {
             lens.copy_to(&mut encoder, frame_texture);
-        } else if let Some(kept) = l.kept.as_ref().filter(|_| surface_only) {
-            let (w, h) = l.px;
-            encoder.copy_texture_to_texture(kept.0.as_image_copy(), frame_texture.as_image_copy(), wgpu::Extent3d { width: w.min(frame_texture.width()), height: h.min(frame_texture.height()), depth_or_array_layers: 1 });
+        } else if let Some(kept) = l.kept.as_ref().filter(|_| keeps_canvas) {
+            let (w, h) = (l.px.0.min(frame_texture.width()), l.px.1.min(frame_texture.height()));
+            match copies.as_ref().filter(|_| from_kept) {
+                // Our own frame: only what it lacks.
+                Some(pieces) => {
+                    for &[x, y, pw, ph] in pieces {
+                        let (pw, ph) = (pw.min(w.saturating_sub(x)), ph.min(h.saturating_sub(y)));
+                        if pw > 0 && ph > 0 {
+                            let at = wgpu::Origin3d { x, y, z: 0 };
+                            encoder.copy_texture_to_texture(
+                                wgpu::TexelCopyTextureInfo { origin: at, ..kept.0.as_image_copy() },
+                                wgpu::TexelCopyTextureInfo { origin: at, ..frame_texture.as_image_copy() },
+                                wgpu::Extent3d { width: pw, height: ph, depth_or_array_layers: 1 },
+                            );
+                        }
+                    }
+                }
+                None => encoder.copy_texture_to_texture(kept.0.as_image_copy(), frame_texture.as_image_copy(), wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 }),
+            }
         }
         let t1 = timing.then(std::time::Instant::now);
         let commands = encoder.finish();
@@ -3190,8 +3269,13 @@ impl Gpu {
                 self.queue.present(frame);
             }
             Frame::Lent(which, _) => {
+                if request_frame {
+                    l.window.request_frame();
+                }
+                // What the compositor is told changed: those pieces, none if
+                // nothing did, all of it if they are not known.
                 if let Target::Frames(frames) = &mut l.target {
-                    frames.present(which, index, &self.device, &self.queue, scissor);
+                    frames.present_pieces(which, index, &self.device, &self.queue, cuts.as_deref());
                 }
             }
         }
@@ -3308,6 +3392,9 @@ impl Sheet {
 
     pub fn request_backdrop(&mut self, on_change: bool) {
         let Some(bounds) = self.glass_box else { return };
+        if let Target::Frames(frames) = &mut self.target {
+            frames.settle();
+        }
         if self.window.capture_backdrop(bounds, on_change) {
             self.asked_box = bounds;
             self.capture = if on_change { BackdropCapture::Watching } else { BackdropCapture::AfterPresent };
