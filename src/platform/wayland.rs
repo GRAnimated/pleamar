@@ -107,7 +107,46 @@ struct OwnFrame {
     buffer: WlBuffer,
     /// On screen or on its way there: not to be painted in.
     busy: Arc<std::sync::atomic::AtomicBool>,
-    _fd: std::os::fd::OwnedFd,
+    fd: std::os::fd::OwnedFd,
+}
+
+/// Whether nobody is still reading or writing that frame on the card, waiting
+/// for it up to `wait` (none: just asking). A compositor lets go of a frame
+/// (`wl_buffer.release`) once it has asked the card to read it, not once the
+/// card has: the kernel keeps that read on the buffer, and a program that
+/// paints with the system's own frames waits for it without knowing. Ours are
+/// painted by Vulkan as plain memory, which does not wait: painted in at
+/// once, on Hyprland with an AMD card, a frame was being brought up to date
+/// while the compositor was still putting it on the screen, and pieces of an
+/// older one showed through, flickering. Without the kernel's answer
+/// (before Linux 6.0), it is taken as free.
+fn card_done_with(fd: &std::os::fd::OwnedFd, wait: std::time::Duration) -> bool {
+    #[repr(C)]
+    struct ExportSyncFile {
+        flags: u32,
+        fd: i32,
+    }
+    // DMA_BUF_IOCTL_EXPORT_SYNC_FILE, asking for what a write has to wait for:
+    // every read and write still pending.
+    const EXPORT_SYNC_FILE: libc::c_ulong = 0xC008_6202;
+    const SYNC_WRITE: u32 = 2;
+    let mut arg = ExportSyncFile { flags: SYNC_WRITE, fd: -1 };
+    // SAFETY: a dmabuf of ours and the structure the call fills.
+    let r = unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(fd), EXPORT_SYNC_FILE, &mut arg) };
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| match r {
+        0 => println!("render · our frames are painted in again once the card has finished reading them"),
+        _ => println!("render · the kernel does not say when the card has finished reading our frames ({}): they are painted in again when the compositor lets go of them", std::io::Error::last_os_error()),
+    });
+    if r != 0 || arg.fd < 0 {
+        return true;
+    }
+    // SAFETY: the call has just made this file, and it is ours to close.
+    let fence = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(arg.fd) };
+    let mut p = libc::pollfd { fd: std::os::fd::AsRawFd::as_raw_fd(&fence), events: libc::POLLIN, revents: 0 };
+    // SAFETY: one pollfd of ours.
+    let n = unsafe { libc::poll(&mut p, 1, wait.as_millis().min(i32::MAX as u128) as i32) };
+    n > 0
 }
 
 enum Show {
@@ -148,7 +187,7 @@ impl OwnFrames {
             let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let buffer = params.create_immed(self.px.0 as i32, self.px.1 as i32, crate::dmabuf::ARGB, zwp_linux_buffer_params_v1::Flags::empty(), &d.qh, Released(busy.clone()));
             params.destroy();
-            self.frames.push(OwnFrame { texture: e.texture, buffer, busy, _fd: e.fd });
+            self.frames.push(OwnFrame { texture: e.texture, buffer, busy, fd: e.fd });
         }
         let _ = d.connection.flush();
         println!("render · {} frames of our own of {}×{} handed to the compositor, with what changed in each", self.frames.len(), self.px.0, self.px.1);
@@ -169,9 +208,18 @@ impl gpu::Frames for OwnFrames {
             self.failed = true;
             return None;
         }
-        // Not the one just handed over, which may not be on screen yet.
-        let free = |k: &usize| !self.frames[*k].busy.load(Ordering::Acquire);
-        let k = (0..self.frames.len()).filter(|k| Some(*k) != self.latest).find(free)?;
+        // Not the one just handed over, which may not be on screen yet; of
+        // the others, one the card has finished reading (see `card_done_with`),
+        // or else the first let go of, once the card is done with it.
+        let free: Vec<usize> = (0..self.frames.len()).filter(|k| Some(*k) != self.latest && !self.frames[*k].busy.load(Ordering::Acquire)).collect();
+        let k = match free.iter().copied().find(|k| card_done_with(&self.frames[*k].fd, std::time::Duration::ZERO)) {
+            Some(k) => k,
+            None => {
+                let k = *free.first()?;
+                card_done_with(&self.frames[k].fd, std::time::Duration::from_millis(100));
+                k
+            }
+        };
         Some((k, self.frames[k].texture.clone()))
     }
 
