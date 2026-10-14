@@ -436,14 +436,15 @@ fn position_on_output(anchor: Anchor, margin: [i32; 4], size: (u32, u32), output
 struct CaptureFor {
     target: Arc<BackdropTarget>,
     on_change: bool,
-    format: Mutex<Option<(u32, u32, u32)>>,
+    /// What the compositor offers to copy it into: size, stride and format.
+    format: Mutex<Option<(u32, u32, u32, wl_shm::Format)>>,
 }
 
 /// The memory where the compositor leaves a surface's captures. It's
 /// reused as long as it has the same size.
 struct CaptureBuffer {
     map: Arc<MappedMemory>,
-    size: (u32, u32, u32),
+    size: (u32, u32, u32, wl_shm::Format),
     _pool: WlShmPool,
     buffer: WlBuffer,
     _fd: std::os::fd::OwnedFd,
@@ -484,9 +485,13 @@ impl Dispatch2<ZwlrScreencopyFrameV1, State> for CaptureFor {
             self.target.in_flight.store(false, Ordering::Relaxed);
         };
         match ev {
-            // Only in the usual format: four bytes, blue first.
+            // Only in the usual format: four bytes, blue first, and the buffer
+            // in the very format offered (only its colours are read: the
+            // fourth byte does not matter). Made always as ARGB, niri, which
+            // offers XRGB, called it an invalid buffer and closed the program
+            // (issue 50).
             E::Buffer { format: wayland_client::WEnum::Value(f), width, height, stride } if matches!(f, wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888) => {
-                *self.format.lock().unwrap() = Some((width, height, stride));
+                *self.format.lock().unwrap() = Some((width, height, stride, f));
             }
             E::BufferDone => {
                 let (Some(size), Some((_, shm))) = (*self.format.lock().unwrap(), SCREENCOPY.get()) else { return finish(frame) };
@@ -500,7 +505,7 @@ impl Dispatch2<ZwlrScreencopyFrameV1, State> for CaptureFor {
                         return finish(frame);
                     }
                     let pool = shm.create_pool(std::os::fd::AsFd::as_fd(&fd), len as i32, qh, Silent);
-                    let buffer = pool.create_buffer(0, size.0 as i32, size.1 as i32, size.2 as i32, wl_shm::Format::Argb8888, qh, Silent);
+                    let buffer = pool.create_buffer(0, size.0 as i32, size.1 as i32, size.2 as i32, size.3, qh, Silent);
                     e.capture_buffers.insert(id, CaptureBuffer { map: Arc::new(MappedMemory { ptr: ptr as *mut u8, len }), size, _pool: pool, buffer, _fd: fd });
                 }
                 // When watching, it waits for something to change: with what's behind
