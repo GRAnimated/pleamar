@@ -512,6 +512,8 @@ pub fn run(
     let mut blinks: Vec<(Instant, Option<Instant>)> = Vec::new();
     // What each `follow` and `bind` last came to, and what it reads.
     let mut follows = Follows::default();
+    // The facts as they were when what is bound was last computed (see the rules).
+    let mut facts_at_binds: Vec<f32> = Vec::new();
     let mut pending: Vec<(Instant, Transition)> = Vec::new();
     let mut layers: Vec<LayerState> = Vec::new();
     let mut rules: Vec<RuleState> = Vec::new();
@@ -2489,6 +2491,27 @@ pub fn run(
         };
         let rule_asleep = |k: usize| asleep.iter().any(|t| t.rules.contains(&k));
 
+        // What is bound is brought up to date before the rules too, when a
+        // fact has changed since it was computed. A big `let` is a property
+        // computed with the behaviors, after the rules: a rule that followed a
+        // fact read the `let`s made from it as they were before it changed.
+        // pleamar-wm took the keyboard going to a window on the other monitor
+        // for one going to a window on the same one, and a maximized window
+        // went back to its tile.
+        if facts != facts_at_binds {
+            follows.begin(&scene.behaviors);
+            for (k, behavior) in scene.behaviors.iter().enumerate() {
+                if let Behavior::Bind { prop, to } = behavior {
+                    if absent_behaviors.iter().any(|r| r.contains(&k)) {
+                        continue;
+                    }
+                    let v = follows.value(k, to, &props, &facts);
+                    props[prop.0 as usize].set(v);
+                }
+            }
+            facts_at_binds.clone_from(&facts);
+        }
+
         // Rules: all of this happens here, whatever state the logic is in.
         {
             let c = Ctx { props: &props, facts: &facts, seen: None };
@@ -3240,6 +3263,7 @@ pub fn run(
                 p.set(v);
             }
         }
+        facts_at_binds.clone_from(&facts);
 
         // The popups: open while their fact is true, where and how their expressions
         // say. If they change place or size while open, they are remade.
