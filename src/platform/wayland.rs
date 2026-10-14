@@ -100,6 +100,8 @@ struct OwnFrames {
     latest: Option<usize>,
     failed: bool,
     to_show: Option<Sender<Show>>,
+    /// The same queue, for the window's own commits (see `WaylandWindow::shown`).
+    shared: Arc<Mutex<Option<Sender<Show>>>>,
 }
 
 struct OwnFrame {
@@ -156,6 +158,9 @@ enum Show {
     Forget(Vec<WlBuffer>),
     /// Say so once everything asked before has reached the compositor.
     Settled(std::sync::mpsc::Sender<()>),
+    /// A commit of what the window has changed meanwhile (its input region, its
+    /// keyboard), after the frames asked before it.
+    Commit,
 }
 
 const OWN_FRAMES: usize = 3;
@@ -253,6 +258,7 @@ impl gpu::Frames for OwnFrames {
                             wl.commit();
                         }
                         Show::Forget(buffers) => buffers.iter().for_each(|b| b.destroy()),
+                        Show::Commit => wl.commit(),
                         Show::Settled(done) => {
                             if let Some(c) = &connection {
                                 let _ = c.flush();
@@ -265,6 +271,7 @@ impl gpu::Frames for OwnFrames {
                     }
                 }
             });
+            *self.shared.lock().unwrap() = Some(tx.clone());
             tx
         });
         let _ = tx.send(Show::Frame { buffer: f.buffer.clone(), px: self.px, pieces: pieces.map(|p| p.to_vec()), sent: gpu::Sent::after(queue) });
@@ -300,6 +307,8 @@ impl gpu::Frames for OwnFrames {
 impl Drop for OwnFrames {
     fn drop(&mut self) {
         self.forget();
+        // Back to the system's frames: the window commits by itself again.
+        *self.shared.lock().unwrap() = None;
     }
 }
 
@@ -565,6 +574,29 @@ struct WaylandWindow {
     effect: Mutex<Option<ExtBackgroundEffectSurfaceV1>>,
     /// To see what it has behind. Only layers: for a window it's not known where it is.
     backdrop: Option<Arc<BackdropTarget>>,
+    /// With frames of its own, the queue that hands them to the compositor:
+    /// its other commits go through it too, after the frames asked before.
+    /// Committed straight away, the input region's first commit overtook the
+    /// first frame, still waiting for the card, and a lock screen with no
+    /// buffer was killed by Hyprland (`Null buffer attached`, issue 49).
+    shown: Arc<Mutex<Option<Sender<Show>>>>,
+}
+
+impl WaylandWindow {
+    /// What it has changed, committed: in its turn after the frames, if it has frames of its own.
+    fn commit(&self) {
+        match self.shown.lock().unwrap().as_ref() {
+            Some(tx) => {
+                let _ = tx.send(Show::Commit);
+            }
+            None => {
+                self.wl.commit();
+                if let Some(c) = MOVABLE_LAYERS.get() {
+                    let _ = c.connection.flush();
+                }
+            }
+        }
+    }
 }
 
 fn keyboard_interactivity(t: Keyboard) -> KeyboardInteractivity {
@@ -586,10 +618,7 @@ impl PlatformWindow for WaylandWindow {
             // ever —a transparent wall taking every click—. A commit without a
             // new buffer only applies the pending state.
             self.wl.set_input_region(Some(region.wl_region()));
-            self.wl.commit();
-            if let Some(c) = MOVABLE_LAYERS.get() {
-                let _ = c.connection.flush();
-            }
+            self.commit();
         }
     }
 
@@ -600,10 +629,7 @@ impl PlatformWindow for WaylandWindow {
     fn keyboard(&self, t: Keyboard) {
         if let Some(layer) = &self.layer {
             layer.set_keyboard_interactivity(keyboard_interactivity(t));
-            self.wl.commit();
-            if let Some(c) = MOVABLE_LAYERS.get() {
-                let _ = c.connection.flush();
-            }
+            self.commit();
         }
     }
 
@@ -614,7 +640,7 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn own_frames(&self) -> Option<Box<dyn gpu::Frames>> {
-        (DMABUFS.get().is_some() && !ARGB_LAYOUTS.lock().unwrap().is_empty()).then(|| Box::new(OwnFrames { wl: self.wl.clone(), px: (0, 0), frames: Vec::new(), latest: None, failed: false, to_show: None }) as Box<dyn gpu::Frames>)
+        (DMABUFS.get().is_some() && !ARGB_LAYOUTS.lock().unwrap().is_empty()).then(|| Box::new(OwnFrames { wl: self.wl.clone(), px: (0, 0), frames: Vec::new(), latest: None, failed: false, to_show: None, shared: self.shown.clone() }) as Box<dyn gpu::Frames>)
     }
 
     fn desktop_place(&self) -> Option<(String, (i32, i32))> {
@@ -1449,7 +1475,7 @@ impl PopupHandler for State {
             let _ = self.to_render.send(ToRender::Sheet(Box::new(gpu::NewSheet {
                 id: a.id,
                 target: gpu::Target::Surface(surface),
-                window: Box::new(WaylandWindow { wl: a.popup.wl_surface().clone(), compositor: self.compositor.clone(), cursors: e.cursors.clone(), serial: e.serial.clone(), layer: None, qh: e.qh.clone(), id: a.id, effect: Mutex::new(None), backdrop: a.backdrop.clone() }),
+                window: Box::new(WaylandWindow { wl: a.popup.wl_surface().clone(), compositor: self.compositor.clone(), cursors: e.cursors.clone(), serial: e.serial.clone(), layer: None, qh: e.qh.clone(), id: a.id, effect: Mutex::new(None), backdrop: a.backdrop.clone(), shown: Default::default() }),
                 scale: a.parent.scale,
                 size: a.size,
                 mhz: a.parent.mhz,
@@ -1619,7 +1645,7 @@ impl State {
             let _ = self.to_render.send(ToRender::Sheet(Box::new(gpu::NewSheet {
                 id: p.id,
                 target: gpu::Target::Surface(surface),
-                window: Box::new(WaylandWindow { wl: p.role.wl().clone(), compositor: self.compositor.clone(), cursors: self.cursors.clone(), serial: self.serial.clone(), layer: p.role.layer().cloned(), qh: self.qh.clone(), id: p.id, effect: Mutex::new(None), backdrop: p.backdrop.clone() }),
+                window: Box::new(WaylandWindow { wl: p.role.wl().clone(), compositor: self.compositor.clone(), cursors: self.cursors.clone(), serial: self.serial.clone(), layer: p.role.layer().cloned(), qh: self.qh.clone(), id: p.id, effect: Mutex::new(None), backdrop: p.backdrop.clone(), shown: Default::default() }),
                 scale: p.scale,
                 size,
                 mhz,
@@ -1691,7 +1717,7 @@ impl smithay_client_toolkit::session_lock::SessionLockHandler for State {
             let _ = self.to_render.send(ToRender::Sheet(Box::new(gpu::NewSheet {
                 id: face.id,
                 target: gpu::Target::Surface(paints),
-                window: Box::new(WaylandWindow { wl: face.surface.wl_surface().clone(), compositor: self.compositor.clone(), cursors: self.cursors.clone(), serial: self.serial.clone(), layer: None, qh: self.qh.clone(), id: face.id, effect: Mutex::new(None), backdrop: None }),
+                window: Box::new(WaylandWindow { wl: face.surface.wl_surface().clone(), compositor: self.compositor.clone(), cursors: self.cursors.clone(), serial: self.serial.clone(), layer: None, qh: self.qh.clone(), id: face.id, effect: Mutex::new(None), backdrop: None, shown: Default::default() }),
                 scale: 1.0,
                 size,
                 mhz: face.mhz,
