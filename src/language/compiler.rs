@@ -532,8 +532,13 @@ pub fn compile<'a>(tree: &'a [Entry], files: &'a [String], dirs: &'a [std::path:
             Err(f) => o.errors.push(f),
         }
     }
-    // Until the real one arrives, the one the file asks for.
-    let (w, h) = (o.e.surface().width as f32, o.e.surface().height as f32);
+    // Until the real one arrives, the one the file asks for (a scene that
+    // declares none gets the default one here, not further down: reading it
+    // without one was a panic).
+    let (w, h) = {
+        let s = o.e.surface_mut();
+        (s.width as f32, s.height as f32)
+    };
     o.e.facts[0].1 = if w > 0.0 { w } else { 1920.0 };
     o.e.facts[1].1 = h;
     for (which, tokens, (l, col)) in std::mem::take(&mut o.pending_surfaces) {
@@ -2402,12 +2407,16 @@ impl<'a> Compiler<'a> {
                 if values.len() > 8 {
                     return c.error("a shader takes up to eight numbers: `s.a` and `s.b`, four each");
                 }
+                // `shader: wave, a, b while bending`: only while that holds —a
+                // shader that, its numbers at rest, would return what the group
+                // holds as it is still costs the group a pass of its own—.
+                let on = if c.word("while") { Some(self.expr(c)?) } else { None };
                 let u = self.e.shaders[k as usize].clone();
                 if u.behind {
                     return c.error("a group's shader reads what the group holds, with `inside(s, at)`: `behind` is for a `shader { … }` of its own");
                 }
                 let time = u.animated.then(|| self.time_prop().e());
-                Some(GroupShader { shader: k, values, time })
+                Some(GroupShader { shader: k, values, time, on })
             }
             None => None,
         };

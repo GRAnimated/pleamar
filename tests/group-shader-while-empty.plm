@@ -1,0 +1,9 @@
+// expect: error «expected a number, a name or a parenthesis here»
+scene GroupShaderWhileEmpty {
+    surface { size: 200, 100 }
+    shader wet = file "shaders/wet.wgsl"
+    group {
+        shader: wet, 1 while
+        box { from: 10, 10; size: 180, 80; color: #9ed6bd }
+    }
+}

@@ -59,7 +59,7 @@ impl Pipelines {
     }
 }
 
-fn texture(d: &wgpu::Device, label: &str, (w, h): (u32, u32), format: wgpu::TextureFormat, usage: wgpu::TextureUsages) -> (wgpu::Texture, wgpu::TextureView) {
+pub fn texture(d: &wgpu::Device, label: &str, (w, h): (u32, u32), format: wgpu::TextureFormat, usage: wgpu::TextureUsages) -> (wgpu::Texture, wgpu::TextureView) {
     let t = d.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
@@ -146,6 +146,11 @@ impl Lens {
             born: std::time::Instant::now(),
             group: None,
         }
+    }
+
+    /// Which of the two canvases this frame is painted on.
+    pub fn next(&self) -> usize {
+        self.next
     }
 
     /// Where this frame is painted.

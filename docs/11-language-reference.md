@@ -606,7 +606,7 @@ follow a fact, a spring or the pointer:
 
 | | |
 | --- | --- |
-| `shine: x, y` | where the light comes from: a point in the scene. The edge that faces it lights up, and moving the shape or the point moves the highlight round the rim. `shine: pointer` is the light in your hand. Without it, from the top left |
+| `shine: x, y` | where the light comes from: a point in the scene. The edge that faces it lights up, and moving the shape or the point moves the highlight round the rim. `shine: pointer` is the light in your hand; it turns in steps of 2°, so a big body is not painted again for every pixel the pointer moves. Without it, from the top left |
 | `refraction: 100%` | how thick the glass is: how much its edge bends what is behind. `0` is flat glass, `200%` a thick lens |
 | `dispersion: 100%` | how far red, green and blue come apart where it bends: the rainbow on the edge (an Abbe number of 10 at `100%`, of 5 at `200%`). `0` is none |
 | `dome: 0%` | the middle as a magnifying glass: what is behind looks bigger towards the centre (negative, smaller) |
@@ -886,7 +886,7 @@ scene Effects {
 | `hue: angle` | turns every colour round the colour wheel: `hue: 120deg` makes red green |
 | `mask: x1, y1 to x2, y2` | whole at the first point, gone at the second, along that line |
 | `mask: radial x, y radius r` · `… radius r1 to r2` | whole at the centre (or up to `r1`), gone at `r` (or `r2`) |
-| `shader: rain, a, b, …` | one of the scene's own shaders (§8.1) **over what the group holds**: it reads it with `inside(s, at)` and what it returns is seen instead. Its box is the group's, the numbers after the name are `s.a` and `s.b`, and `s.time` runs if it reads it. That is how a window becomes wet glass: drops that bend what the program shows. It goes before the other effects (a `saturation:` greys what the shader returns); `blur` and `glow` read the group as it was. It cannot call `behind` |
+| `shader: rain, a, b, …` | one of the scene's own shaders (§8.1) **over what the group holds**: it reads it with `inside(s, at)` and what it returns is seen instead. Its box is the group's, the numbers after the name are `s.a` and `s.b`, and `s.time` runs if it reads it. That is how a window becomes wet glass: drops that bend what the program shows. **`shader: rain, wet while raining`**: only while that holds; the rest of the time the group is painted as if it had none, and without a pass of its own if nothing else asks for one —a shader whose numbers at rest give back what the group holds still costs that pass, the size of the group, every frame—. It goes before the other effects (a `saturation:` greys what the shader returns); `blur` and `glow` read the group as it was. It cannot call `behind` |
 | `mode: add` · `mode: screen` · `mode: multiply` | how it blends with what is under it, as one thing. `add` **adds light**: what it holds brightens whatever is under it, also the desktop behind the surface. `screen` lightens —never past white, never darker—; over nothing it is simply itself. `multiply` darkens what **the scene** painted under it, tinting it; the desktop behind the surface is not in pleamar's hands, so over nothing it paints nothing (rather than black). `mode: normal` is the default |
 
 All of them are expressions, so they animate like anything else: `blur: 8 * (1

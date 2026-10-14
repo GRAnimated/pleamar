@@ -20,6 +20,8 @@ const IDLE_LAYER_FRAMES: u32 = 300;
 /// How many frames a surface keeps what it took of its own painting for its
 /// glass after the last one that needed it.
 const IDLE_OWN_FRAMES: u32 = 300;
+/// How many frames a surface keeps its canvas (`Sheet::kept`) painting all of it every time.
+const IDLE_KEPT_FRAMES: u32 = 300;
 /// The strip added to the surface for the frame graph.
 pub const HUD_HEIGHT: f32 = 84.0;
 /// How much room to start with. If a scene asks for more, the stores grow to double.
@@ -36,6 +38,9 @@ const INITIAL_ELEMENTS: usize = 1024;
 #[derive(Default)]
 pub struct DrawList {
     pub shapes: Vec<f32>,
+    /// The box of each shape, in the scene's plane (empty, one that does not
+    /// exist): when only some shapes of a body change, that is where it changed.
+    pub shape_bounds: Vec<[f32; 4]>,
     /// The points of the paths, in x, y pairs: each path takes a stretch.
     pub points: Vec<f32>,
     /// The gradient stops: r, g, b and where each one falls.
@@ -137,6 +142,7 @@ pub struct WindowTex {
 #[derive(Default)]
 pub struct PreviousFrame {
     shapes: Vec<f32>,
+    shape_bounds: Vec<[f32; 4]>,
     points: Vec<f32>,
     stops: Vec<f32>,
     elements: Vec<f32>,
@@ -173,13 +179,26 @@ impl PreviousFrame {
                 .collect();
             let changed = |k: f32| k >= 0.0 && shape_changed.get(k as usize).copied().unwrap_or(true);
             for (a, b) in self.elements.chunks_exact(PER_ELEMENT).zip(d.elements.chunks_exact(PER_ELEMENT)) {
-                let mut change = bits(a) != bits(b);
-                // A body is its shapes; a clip is also a shape.
+                // A clip is also a shape.
+                let change = bits(a) != bits(b) || b[32..36].iter().any(|&r| changed(r)) || (b[0] == 0.0 && !same_stops && b[15] > 0.5);
+                // A body is its shapes: if only some of them changed —a drawer
+                // that slides out of a bar the size of the screen—, it changed
+                // where they are, before and after, and as far as their melting
+                // and the body's shadow and border reach around them.
                 if !change && b[0] == 0.0 {
-                    change = (b[1] as usize..b[1] as usize + b[2] as usize).any(|k| changed(k as f32)) || (!same_stops && b[15] > 0.5);
-                }
-                if !change {
-                    change = b[32..36].iter().any(|&r| changed(r));
+                    let mine = b[1] as usize..b[1] as usize + b[2] as usize;
+                    if mine.clone().any(|k| changed(k as f32)) {
+                        let melt = mine.clone().filter_map(|k| d.shapes.get(k * PER_SHAPE + 1)).fold(0.0f32, |m, k| m.max(*k));
+                        let (dx, dy) = (b[28].abs(), b[29].abs());
+                        let m = melt + b[30].max(0.0) + b[23].max(0.0) + 4.0;
+                        for k in mine.filter(|k| changed(*k as f32)) {
+                            for r in [self.shape_bounds.get(k), d.shape_bounds.get(k)].into_iter().flatten() {
+                                if r[2] > r[0] && r[3] > r[1] {
+                                    rects.push([r[0] - m - dx, r[1] - m - dy, r[2] + m + dx, r[3] + m + dy]);
+                                }
+                            }
+                        }
+                    }
                 }
                 if change {
                     rects.push([a[4], a[5], a[6], a[7]]);
@@ -189,6 +208,7 @@ impl PreviousFrame {
             true
         };
         self.shapes.clone_from(&d.shapes);
+        self.shape_bounds.clone_from(&d.shape_bounds);
         self.points.clone_from(&d.points);
         self.stops.clone_from(&d.stops);
         self.elements.clone_from(&d.elements);
@@ -388,8 +408,17 @@ fn glass_options(e: &mut [f32], g: Option<&crate::scene::Glass>, b: [f32; 4], c:
     e[43] = g.refraction.eval(c);
     if let Some((x, y)) = &g.shine {
         let (dx, dy) = (x.eval(c) - centre.0, y.eval(c) - centre.1);
-        let l = (dx * dx + dy * dy).sqrt();
-        let (dx, dy) = if l > 1.0 { (dx / l, dy / l) } else { (0.0, -1.0) };
+        // In steps of 2°: a light that follows the pointer changes the glass
+        // every few pixels it moves, not on every one —each change is the
+        // whole body painted again, and a bar round the screen is the
+        // screen—. Its edges brighten or dim by a hair at each step.
+        const STEP: f32 = std::f32::consts::TAU / 180.0;
+        let (dx, dy) = if dx * dx + dy * dy > 1.0 {
+            let a = (dy.atan2(dx) / STEP).round() * STEP;
+            (a.cos(), a.sin())
+        } else {
+            (0.0, -1.0)
+        };
         e[52..55].copy_from_slice(&[dx, dy, 1.0]);
     }
     e[55] = g.dome.eval(c);
@@ -609,6 +638,7 @@ impl DrawList {
         let k = self.shapes.len() / PER_SHAPE;
         self.shapes.resize(self.shapes.len() + PER_SHAPE, 0.0);
         p.encode(blend, &mut self.shapes[k * PER_SHAPE..]);
+        self.shape_bounds.push(p.bounds().unwrap_or([0.0; 4]));
         k
     }
 
@@ -885,6 +915,7 @@ impl DrawList {
         self.size = size;
         self.own_size = (size.0, size.1 - if hud { HUD_HEIGHT } else { 0.0 });
         self.shapes.clear();
+        self.shape_bounds.clear();
         self.points.clear();
         self.elements.clear();
         let mut placed_stops: Vec<f32> = Vec::new();
@@ -1040,7 +1071,7 @@ impl DrawList {
                             }
                         };
                         let glow = fx.glow.as_ref().map_or((0.0, 0.0, None), |(r, k, col)| (r.eval(c).max(0.0), k.eval(c).max(0.0), col.as_ref().map(&color)));
-                        let shader = fx.shader.as_ref().map(|g| {
+                        let shader = fx.shader.as_ref().filter(|g| g.on.as_ref().is_none_or(|e| e.eval(c) != 0.0)).map(|g| {
                             let mut v = [0f32; 8];
                             for (slot, e) in v.iter_mut().zip(&g.values) {
                                 *slot = e.eval(c);
@@ -1650,6 +1681,7 @@ impl DrawList {
         }
         if self.shapes.is_empty() {
             self.shapes.resize(PER_SHAPE, 0.0);
+            self.shape_bounds.push([0.0; 4]);
         }
         if self.elements.is_empty() {
             self.elements.resize(PER_ELEMENT, 0.0);
@@ -1734,11 +1766,19 @@ pub enum BackdropCapture {
 /// with its layers and its uniforms.
 pub struct Sheet {
     pub id: u32,
-    /// For lent frames: a count of the frames painted, which one each buffer
-    /// last got, and what changed in the last ones (their box; `None`, all).
+    /// For a canvas whose contents are known —lent frames, the lens's two,
+    /// the one kept—: a count of the frames painted, which one each canvas
+    /// last got, and what changed in the last ones (their boxes, in pixels; `None`, all).
+    /// `known_as`: which kind of canvas that is about, and at what size.
     frame_no: u64,
     painted_as: Vec<Option<u64>>,
-    damage_log: std::collections::VecDeque<(u64, Option<[f32; 4]>)>,
+    damage_log: std::collections::VecDeque<(u64, Option<Vec<[f32; 4]>>)>,
+    known_as: (u8, (u32, u32)),
+    /// On a surface without a lens: the canvas it is painted on, which stays
+    /// from frame to frame and is copied to the screen, so only what changed
+    /// is painted again. And how many frames it has gone without that.
+    kept: Option<(wgpu::Texture, wgpu::TextureView)>,
+    idle_kept_frames: u32,
     #[allow(dead_code)]
     pub name: String,
     pub mhz: i32,
@@ -1784,6 +1824,11 @@ pub struct Sheet {
     pub capture_asked: std::time::Instant,
     /// The last capture requested after presenting: it sets the pace of the captures.
     pub capture_taken: std::time::Instant,
+    /// What changed in its piece of the plane since it was last painted that
+    /// the round painting it will not say: rounds it skipped —waiting for a
+    /// capture, or for the compositor to let go of a buffer— and what is
+    /// behind its glass, when a capture comes in. Boxes in the scene's plane.
+    pub owed_damage: Vec<[f32; 4]>,
     /// Whether it has been painted in this round of the render.
     pub painted_now: bool,
     /// Which piece of the plane and at which scale it has painted, if what it
@@ -2243,8 +2288,8 @@ impl Gpu {
         });
         let (layer_views, layer_group) = Self::make_layers(&self.device, &self.pipeline, self.format, 1, 1, 1);
         let mut l = Sheet {
-            id: n.id, frame_no: 0, painted_as: Vec::new(), damage_log: Default::default(), name: n.name, mhz: n.mhz, scale: n.scale, drives_pace: true, open: true, cleared: false, view: n.view,
-            target: n.target, window: n.window, px: (0, 0), uniforms, uniform_group, layer_views, layer_group, layers: 0, idle_layer_frames: 0, blur_rects: Vec::new(), lens: None, own: None, idle_own_frames: 0, wants_lens: false, capture: BackdropCapture::Idle, glass_box: None, asked_box: [0; 4], capture_asked: std::time::Instant::now(), capture_taken: long_ago(), painted_now: false, painted: None, input_region: vec![[-1, -1, -1, -1]], presented: false, keyboard_mode: None,
+            id: n.id, frame_no: 0, painted_as: Vec::new(), damage_log: Default::default(), known_as: (0, (0, 0)), kept: None, idle_kept_frames: 0, name: n.name, mhz: n.mhz, scale: n.scale, drives_pace: true, open: true, cleared: false, view: n.view,
+            target: n.target, window: n.window, px: (0, 0), uniforms, uniform_group, layer_views, layer_group, layers: 0, idle_layer_frames: 0, blur_rects: Vec::new(), lens: None, own: None, idle_own_frames: 0, wants_lens: false, capture: BackdropCapture::Idle, glass_box: None, asked_box: [0; 4], capture_asked: std::time::Instant::now(), capture_taken: long_ago(), owed_damage: Vec::new(), painted_now: false, painted: None, input_region: vec![[-1, -1, -1, -1]], presented: false, keyboard_mode: None,
         };
         self.reconfigure(&mut l, size);
         l
@@ -2260,6 +2305,7 @@ impl Gpu {
             l.px = px;
             // A canvas of another size is no longer valid: another is made when needed.
             l.lens = None;
+            l.kept = None;
             // Whatever there were no longer match the surface: they are requested again when needed.
             self.release_layers(l);
         }
@@ -2716,6 +2762,9 @@ impl Gpu {
             l.lens = None;
         } else if l.lens.is_none() {
             l.lens = Some(crate::lens::Lens::new(&self.device, self.format, l.px));
+            // New canvases: nothing is known of what they hold.
+            l.painted_as.clear();
+            l.damage_log.clear();
         }
         // A surface has what is behind it, but a glass of its with something
         // of the scene's own under it —a picture, a text, another shape— has
@@ -2768,53 +2817,100 @@ impl Gpu {
             Frame::Surface(f) => &f.texture,
             Frame::Lent(_, t) => t,
         };
-        // Only for lent frames: which piece of it has to be painted again —what
-        // changed now, and since that buffer was last painted— in pixels.
-        let scissor: Option<[u32; 4]> = match &frame {
-            Frame::Surface(_) => None,
-            // `PLEAMAR_FULL_REPAINT=1`: every frame whole, to compare.
-            Frame::Lent(_, _) if std::env::var_os("PLEAMAR_FULL_REPAINT").is_some() => None,
-            // Closed, it is cleared whole: a piece left of what it showed stayed
-            // in one of its frames, and the monitor alternated it with the empty one.
-            Frame::Lent(which, _) if !l.open => {
+        // A surface without a lens paints on a canvas of its own that stays,
+        // while what changed is known: then only that is painted again, and
+        // the canvas is copied whole to the screen —a copy costs the card far
+        // less than painting a glass the size of the monitor—. Given back
+        // after a while of everything changing at once.
+        let full_repaint = std::env::var_os("PLEAMAR_FULL_REPAINT").is_some();
+        let surface_only = matches!(frame, Frame::Surface(_)) && l.lens.is_none();
+        if surface_only && self.can_copy && damage.is_some() && l.open && !full_repaint {
+            l.idle_kept_frames = 0;
+            if l.kept.is_none() {
+                l.kept = Some(crate::lens::texture(&self.device, "kept", l.px, self.format, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC));
                 l.painted_as.clear();
                 l.damage_log.clear();
-                let _ = which;
+            }
+        } else if l.kept.is_some() {
+            l.idle_kept_frames += 1;
+            if !surface_only || l.idle_kept_frames > IDLE_KEPT_FRAMES {
+                l.kept = None;
+            }
+        }
+        // Which canvas this frame goes on, if what it holds is known: one
+        // the platform lends, one of the lens's two, or the kept one.
+        let known: Option<(u8, usize)> = match &frame {
+            Frame::Lent(which, _) => Some((1, *which)),
+            Frame::Surface(_) => match (&l.lens, &l.kept) {
+                (Some(lens), _) => Some((2, lens.next())),
+                (None, Some(_)) => Some((3, 0)),
+                (None, None) => None,
+            },
+        };
+        if known.map(|k| (k.0, l.px)) != Some(l.known_as) {
+            l.painted_as.clear();
+            l.damage_log.clear();
+            l.known_as = known.map_or((0, (0, 0)), |k| (k.0, l.px));
+        }
+        // Which pieces of it have to be painted again —what changed now, and
+        // since that canvas was last painted— in pixels: a few boxes, not
+        // one around them all, which for a bar round the edge of the screen
+        // that lights up at one end and at the other is the whole screen.
+        let cuts: Option<Vec<[u32; 4]>> = match known {
+            None => None,
+            // `PLEAMAR_FULL_REPAINT=1`: every frame whole, to compare.
+            Some(_) if full_repaint => None,
+            // Closed, it is cleared whole: a piece left of what it showed stayed
+            // in one of its frames, and the monitor alternated it with the empty one.
+            Some(_) if !l.open => {
+                l.painted_as.clear();
+                l.damage_log.clear();
                 None
             }
-            Frame::Lent(which, _) => {
+            Some((_, which)) => {
                 let v = l.view.bounds();
-                let now: Option<[f32; 4]> = damage.map(|rects| {
-                    rects
-                        .iter()
-                        .filter(|b| b[0] < v[2] && b[2] > v[0] && b[1] < v[3] && b[3] > v[1])
-                        .map(|b| [((b[0] - v[0]) * l.scale).floor().max(0.0), ((b[1] - v[1]) * l.scale).floor().max(0.0), ((b[2] - v[0]) * l.scale).ceil().min(l.px.0 as f32), ((b[3] - v[1]) * l.scale).ceil().min(l.px.1 as f32)])
-                        .fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])])
+                let (pw, ph) = (l.px.0 as f32, l.px.1 as f32);
+                let now: Option<Vec<[f32; 4]>> = damage.map(|rects| {
+                    merge_cuts(rects.iter().filter(|b| b[0] < v[2] && b[2] > v[0] && b[1] < v[3] && b[3] > v[1]).map(|b| {
+                        [((b[0] - v[0]) * l.scale).floor().max(0.0), ((b[1] - v[1]) * l.scale).floor().max(0.0), ((b[2] - v[0]) * l.scale).ceil().min(pw), ((b[3] - v[1]) * l.scale).ceil().min(ph)]
+                    }))
                 });
                 let frame_no = l.frame_no;
                 l.frame_no += 1;
-                if l.painted_as.len() <= *which {
-                    l.painted_as.resize(*which + 1, None);
+                if l.painted_as.len() <= which {
+                    l.painted_as.resize(which + 1, None);
                 }
-                let since = l.painted_as[*which];
-                l.painted_as[*which] = Some(frame_no);
+                let since = l.painted_as[which];
+                l.painted_as[which] = Some(frame_no);
                 l.damage_log.push_back((frame_no, now));
                 while l.damage_log.len() > 8 {
                     l.damage_log.pop_front();
                 }
-                // Everything, unless every frame since that buffer was painted is known.
+                // Everything, unless every frame since that canvas was painted is known.
                 let region = since.and_then(|p| {
                     let complete = l.damage_log.front().is_some_and(|(n, _)| *n <= p + 1);
-                    complete.then(|| l.damage_log.iter().filter(|(n, _)| *n > p).try_fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |a, (_, b)| b.map(|b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])])))?
+                    let mut all = Vec::new();
+                    for (_, b) in l.damage_log.iter().filter(|(n, _)| *n > p) {
+                        all.extend_from_slice(b.as_ref()?);
+                    }
+                    complete.then(|| merge_cuts(all.into_iter()))
                 });
-                match region {
-                    // Nothing changed for this buffer: it is shown as it is.
-                    Some(r) if r[2] <= r[0] || r[3] <= r[1] => Some([0, 0, 0, 0]),
-                    Some(r) => Some([r[0] as u32, r[1] as u32, (r[2] - r[0]) as u32, (r[3] - r[1]) as u32]),
-                    None => None,
-                }
+                // Most of it changed: it is painted whole, in one go.
+                region.filter(|r| r.iter().map(|b| (b[2] - b[0]) * (b[3] - b[1])).sum::<f32>() < 0.7 * pw * ph).map(|r| {
+                    r.iter().map(|b| [b[0] as u32, b[1] as u32, (b[2] - b[0]) as u32, (b[3] - b[1]) as u32]).collect()
+                })
             }
         };
+        // The box round them all: what the compositor is told changed.
+        // Nothing changed for this canvas: it is shown as it is.
+        let scissor: Option<[u32; 4]> = cuts.as_ref().map(|c| {
+            c.iter().fold(None, |u: Option<[u32; 4]>, b| {
+                Some(u.map_or(*b, |u| {
+                    let (x0, y0) = (u[0].min(b[0]), u[1].min(b[1]));
+                    [x0, y0, (u[0] + u[2]).max(b[0] + b[2]) - x0, (u[1] + u[3]).max(b[1] + b[3]) - y0]
+                }))
+            }).unwrap_or([0, 0, 0, 0])
+        });
         let view = frame_texture.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
         #[cfg(target_os = "linux")]
@@ -2894,144 +2990,174 @@ impl Gpu {
         // a few, so there can be as many as the scene wants and they cost the
         // memory of at most `LAYER_SLOTS`. The target is cleared once, at the
         // start; the following stretches paint on top of it.
-        let target = match &l.lens {
+        let target = match (&l.lens, &l.kept) {
             // With a lens, on its canvas, which is then copied to the screen: one
             // has to know exactly what was painted to unmix what is behind.
-            Some(lens) => lens.canvas(),
-            None => &view,
+            (Some(lens), _) => lens.canvas(),
+            (None, Some(kept)) if surface_only => &kept.1,
+            _ => &view,
         };
         // Closed, it is cleared: transparent and nothing on top. Painting what
         // is in the draw list will not do, because it closes in the middle of
         // a frame —the draw list was composed while it was still open— and
         // that frame stayed forever: in Marea, a piece of the little ball about
         // to come out through the edge.
-        let total = if l.open { d.element_count() as u32 } else { 0 };
-        let groups: &[(Range<u32>, usize)] = if l.open { &d.offscreen_groups } else { &[] };
-        let mut from = 0u32;
-        // Painting a piece of it, the rest of what it held stays.
-        let mut keep = scissor.is_some();
-        // The first pass onto the target empties the piece it paints.
-        let mut erase = keep;
-        // Nothing to paint again: what that buffer holds is already this frame.
-        let (total, groups): (u32, &[(Range<u32>, usize)]) = if scissor == Some([0, 0, 0, 0]) { (0, &[]) } else { (total, groups) };
-        // Where it is painted, in the scene's plane: the piece that changed if
-        // only that is painted again, else all of the view. A group that does
-        // not touch it needs no layer: whatever of it could show is cut away.
-        let v = l.view.bounds();
-        let region = match scissor {
-            Some([x, y, w, h]) => [v[0] + x as f32 / l.scale, v[1] + y as f32 / l.scale, v[0] + (x + w) as f32 / l.scale, v[1] + (y + h) as f32 / l.scale],
-            None => v,
+        // Each piece painted again on its own, cut to its box; or all of it, once.
+        let pieces: Vec<Option<[u32; 4]>> = match &cuts {
+            Some(c) if !c.is_empty() => c.iter().copied().map(Some).collect(),
+            Some(_) => vec![Some([0, 0, 0, 0])],
+            None => vec![None],
         };
-        // What goes straight onto the target is gathered into as few passes as
-        // there are layers painted in between: a pass costs wgpu more than its draws.
-        let mut onto: Vec<Range<u32>> = Vec::new();
-        // On a monitor of pleamar-wm's own, right before each glass, what has
-        // been painted so far is taken as what is behind it: only where there
-        // is glass, and only in the piece painted again. A few times a frame at
-        // most; past that, a glass bends what the one before it saw.
-        // On a surface whose glass is over something of its own, the same,
-        // over what the capture says is behind the surface.
-        // Where a glass is, in real pixels of the sheet, with the margin its
-        // frosting reads: only that is taken for it.
-        let own = l.own.as_ref().filter(|_| with_own);
-        let behind = l.lens.as_ref().and_then(|x| x.background());
-        let (view_origin, sc) = (l.view.bounds(), l.scale);
-        let own_region = |at: &mut dyn Iterator<Item = u32>| -> Option<(u32, u32, u32, u32)> {
-            let own = own?;
-            let (pw, ph) = own.px;
-            let m = crate::lens::MARGIN;
-            let b = at.filter(|k| (*k as usize) < d.element_count()).map(|k| {
-                let e = &d.elements[k as usize * PER_ELEMENT + 4..k as usize * PER_ELEMENT + 8];
-                [e[0] - view_origin[0] - m, e[1] - view_origin[1] - m, e[2] - view_origin[0] + m, e[3] - view_origin[1] + m]
-            }).reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])])?;
-            let mut r = [((b[0] * sc).floor().max(0.0) as u32).min(pw), ((b[1] * sc).floor().max(0.0) as u32).min(ph), ((b[2] * sc).ceil().max(0.0) as u32).min(pw), ((b[3] * sc).ceil().max(0.0) as u32).min(ph)];
-            if let Some([x, y, w, h]) = scissor {
-                r = [r[0].max(x), r[1].max(y), r[2].min(x + w), r[3].min(y + h)];
-            }
-            (r[2] > r[0] && r[3] > r[1]).then(|| (r[0], r[1], r[2] - r[0], r[3] - r[1]))
-        };
-        let mut marks: Vec<u32> = if own.is_some() { d.glass_marks.clone() } else { Vec::new() };
-        marks.sort_unstable();
-        marks.dedup();
-        // Whether something was painted on the target since it was last taken, and how many times it was.
-        let (mut dirty, mut taken) = (true, 0u32);
-        const MOST_TAKEN: u32 = 6;
-        // `then_take`: and after it, take it (a group with glass inside comes next).
-        let mut flush = |encoder: &mut wgpu::CommandEncoder, ranges: &[Range<u32>], keep: &mut bool, erase: &mut bool, then_take: Option<&Range<u32>>| {
-            let mut batch: Vec<Range<u32>> = Vec::new();
-            let paint = |encoder: &mut wgpu::CommandEncoder, batch: &mut Vec<Range<u32>>, keep: &mut bool, erase: &mut bool, dirty: &mut bool| {
-                if !batch.is_empty() || !*keep {
-                    pass_to(encoder, target, &l.layer_group, batch, *keep, scissor, *erase);
-                    *dirty |= !batch.is_empty();
-                    (*keep, *erase) = (true, false);
-                    batch.clear();
-                }
+        for scissor in pieces {
+            let total = if l.open { d.element_count() as u32 } else { 0 };
+            let groups: &[(Range<u32>, usize)] = if l.open { &d.offscreen_groups } else { &[] };
+            let mut from = 0u32;
+            // Painting a piece of it, the rest of what it held stays.
+            let mut keep = scissor.is_some();
+            // The first pass onto the target empties the piece it paints.
+            let mut erase = keep;
+            // Nothing to paint again: what that buffer holds is already this frame.
+            let (total, groups): (u32, &[(Range<u32>, usize)]) = if scissor == Some([0, 0, 0, 0]) { (0, &[]) } else { (total, groups) };
+            // Where it is painted, in the scene's plane: the piece that changed if
+            // only that is painted again, else all of the view. A group that does
+            // not touch it needs no layer: whatever of it could show is cut away.
+            let v = l.view.bounds();
+            let region = match scissor {
+                Some([x, y, w, h]) => [v[0] + x as f32 / l.scale, v[1] + y as f32 / l.scale, v[0] + (x + w) as f32 / l.scale, v[1] + (y + h) as f32 / l.scale],
+                None => v,
             };
-            for r in ranges {
-                let mut start = r.start;
-                for &m in marks.iter().filter(|m| **m >= r.start && **m < r.end) {
-                    if m > start {
-                        batch.push(start..m);
-                        start = m;
+            // What goes straight onto the target is gathered into as few passes as
+            // there are layers painted in between: a pass costs wgpu more than its draws.
+            let mut onto: Vec<Range<u32>> = Vec::new();
+            // On a monitor of pleamar-wm's own, right before each glass, what has
+            // been painted so far is taken as what is behind it: only where there
+            // is glass, and only in the piece painted again. A few times a frame at
+            // most; past that, a glass bends what the one before it saw.
+            // On a surface whose glass is over something of its own, the same,
+            // over what the capture says is behind the surface.
+            // Where a glass is, in real pixels of the sheet, with the margin its
+            // frosting reads: only that is taken for it.
+            let own = l.own.as_ref().filter(|_| with_own);
+            let behind = l.lens.as_ref().and_then(|x| x.background());
+            let (view_origin, sc) = (l.view.bounds(), l.scale);
+            let own_region = |at: &mut dyn Iterator<Item = u32>| -> Option<(u32, u32, u32, u32)> {
+                let own = own?;
+                let (pw, ph) = own.px;
+                let m = crate::lens::MARGIN;
+                let b = at.filter(|k| (*k as usize) < d.element_count()).map(|k| {
+                    let e = &d.elements[k as usize * PER_ELEMENT + 4..k as usize * PER_ELEMENT + 8];
+                    [e[0] - view_origin[0] - m, e[1] - view_origin[1] - m, e[2] - view_origin[0] + m, e[3] - view_origin[1] + m]
+                }).reduce(|a, b| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])])?;
+                let mut r = [((b[0] * sc).floor().max(0.0) as u32).min(pw), ((b[1] * sc).floor().max(0.0) as u32).min(ph), ((b[2] * sc).ceil().max(0.0) as u32).min(pw), ((b[3] * sc).ceil().max(0.0) as u32).min(ph)];
+                if let Some([x, y, w, h]) = scissor {
+                    r = [r[0].max(x), r[1].max(y), r[2].min(x + w), r[3].min(y + h)];
+                }
+                (r[2] > r[0] && r[3] > r[1]).then(|| (r[0], r[1], r[2] - r[0], r[3] - r[1]))
+            };
+            let mut marks: Vec<u32> = if own.is_some() { d.glass_marks.clone() } else { Vec::new() };
+            marks.sort_unstable();
+            marks.dedup();
+            // Whether something was painted on the target since it was last taken, and how many times it was.
+            let (mut dirty, mut taken) = (true, 0u32);
+            const MOST_TAKEN: u32 = 6;
+            // `then_take`: and after it, take it (a group with glass inside comes next).
+            let mut flush = |encoder: &mut wgpu::CommandEncoder, ranges: &[Range<u32>], keep: &mut bool, erase: &mut bool, then_take: Option<&Range<u32>>| {
+                let mut batch: Vec<Range<u32>> = Vec::new();
+                let paint = |encoder: &mut wgpu::CommandEncoder, batch: &mut Vec<Range<u32>>, keep: &mut bool, erase: &mut bool, dirty: &mut bool| {
+                    if !batch.is_empty() || !*keep {
+                        pass_to(encoder, target, &l.layer_group, batch, *keep, scissor, *erase);
+                        *dirty |= !batch.is_empty();
+                        (*keep, *erase) = (true, false);
+                        batch.clear();
                     }
-                    // The last time it can, it takes what every glass still to come is on.
+                };
+                for r in ranges {
+                    let mut start = r.start;
+                    for &m in marks.iter().filter(|m| **m >= r.start && **m < r.end) {
+                        if m > start {
+                            batch.push(start..m);
+                            start = m;
+                        }
+                        // The last time it can, it takes what every glass still to come is on.
+                        let last = taken + 1 == MOST_TAKEN;
+                        let mut these = marks.iter().copied().filter(|k| *k == m || (last && *k > m));
+                        if let (Some(own), Some(region)) = (own.filter(|_| taken < MOST_TAKEN), own_region(&mut these)) {
+                            paint(encoder, &mut batch, keep, erase, &mut dirty);
+                            own.take(self, &self.lens, encoder, target, behind, region, l.scale);
+                            (dirty, taken) = (false, taken + 1);
+                        }
+                    }
+                    if r.end > start {
+                        batch.push(start..r.end);
+                    }
+                }
+                paint(encoder, &mut batch, keep, erase, &mut dirty);
+                if let Some(span) = then_take.filter(|_| taken < MOST_TAKEN) {
                     let last = taken + 1 == MOST_TAKEN;
-                    let mut these = marks.iter().copied().filter(|k| *k == m || (last && *k > m));
-                    if let (Some(own), Some(region)) = (own.filter(|_| taken < MOST_TAKEN), own_region(&mut these)) {
-                        paint(encoder, &mut batch, keep, erase, &mut dirty);
+                    if let (Some(own), Some(region)) = (own, own_region(&mut marks.iter().copied().filter(|m| span.contains(m) || (last && *m >= span.start)))) {
                         own.take(self, &self.lens, encoder, target, behind, region, l.scale);
                         (dirty, taken) = (false, taken + 1);
                     }
                 }
-                if r.end > start {
-                    batch.push(start..r.end);
-                }
-            }
-            paint(encoder, &mut batch, keep, erase, &mut dirty);
-            if let Some(span) = then_take.filter(|_| taken < MOST_TAKEN) {
-                let last = taken + 1 == MOST_TAKEN;
-                if let (Some(own), Some(region)) = (own, own_region(&mut marks.iter().copied().filter(|m| span.contains(m) || (last && *m >= span.start)))) {
-                    own.take(self, &self.lens, encoder, target, behind, region, l.scale);
-                    (dirty, taken) = (false, taken + 1);
-                }
-            }
-        };
-        // A batch at a time (see `DrawList::share_layers`): what comes before
-        // it onto the target, then its groups onto their layers, one pass a
-        // layer; what is between them and their blends go onto the target
-        // with whatever comes next.
-        let batches: &[usize] = if groups.is_empty() { &[] } else { &d.layer_batches };
-        for (b, &first) in batches.iter().enumerate() {
-            let members = &groups[first..batches.get(b + 1).copied().unwrap_or(groups.len())];
-            // The element that blends each comes right after its span: if that one
-            // falls in the region, the layer is needed, even if what is inside does not.
-            let painted: Vec<&(Range<u32>, usize)> = members.iter().filter(|(span, layer)| l.layers as usize > *layer && d.blends(span) && d.touches_view(&(span.start..(span.end + 1).min(total)), region)).collect();
-            onto.push(from..members[0].0.start);
-            if !painted.is_empty() {
-                onto.retain(|r| !r.is_empty());
-                // A glass inside one (alone in its batch) bends what is on the target under the group.
-                let glass_inside = painted.iter().find(|(span, _)| marks.iter().any(|m| span.contains(m))).map(|(span, _)| span);
-                if !onto.is_empty() || !keep || glass_inside.is_some() {
-                    flush(&mut encoder, &onto, &mut keep, &mut erase, glass_inside);
-                    onto.clear();
-                }
-                for (k, view) in l.layer_views.iter().enumerate().take(l.layers as usize) {
-                    let spans: Vec<Range<u32>> = painted.iter().filter(|(_, layer)| *layer == k).map(|(span, _)| span.clone()).collect();
-                    if !spans.is_empty() {
-                        pass_to(&mut encoder, view, &self.no_layers_group, &spans, false, None, false);
+            };
+            // A batch at a time (see `DrawList::share_layers`): what comes before
+            // it onto the target, then its groups onto their layers, one pass a
+            // layer; what is between them and their blends go onto the target
+            // with whatever comes next.
+            let batches: &[usize] = if groups.is_empty() { &[] } else { &d.layer_batches };
+            for (b, &first) in batches.iter().enumerate() {
+                let members = &groups[first..batches.get(b + 1).copied().unwrap_or(groups.len())];
+                // The element that blends each comes right after its span: if that one
+                // falls in the region, the layer is needed, even if what is inside does not.
+                let painted: Vec<&(Range<u32>, usize)> = members.iter().filter(|(span, layer)| l.layers as usize > *layer && d.blends(span) && d.touches_view(&(span.start..(span.end + 1).min(total)), region)).collect();
+                onto.push(from..members[0].0.start);
+                if !painted.is_empty() {
+                    onto.retain(|r| !r.is_empty());
+                    // A glass inside one (alone in its batch) bends what is on the target under the group.
+                    let glass_inside = painted.iter().find(|(span, _)| marks.iter().any(|m| span.contains(m))).map(|(span, _)| span);
+                    if !onto.is_empty() || !keep || glass_inside.is_some() {
+                        flush(&mut encoder, &onto, &mut keep, &mut erase, glass_inside);
+                        onto.clear();
+                    }
+                    for (k, view) in l.layer_views.iter().enumerate().take(l.layers as usize) {
+                        let spans: Vec<Range<u32>> = painted.iter().filter(|(_, layer)| *layer == k).map(|(span, _)| span.clone()).collect();
+                        if !spans.is_empty() {
+                            // Painting a piece of the target, the layer is needed only
+                            // there, and as far as a blur or a glow reaches around it.
+                            // A shader of the scene's may read the group anywhere: whole.
+                            let cut = scissor.and_then(|[x, y, w, h]| {
+                                let mut reach = 0.0f32;
+                                for span in &spans {
+                                    let at = span.end as usize * PER_ELEMENT;
+                                    let e = d.elements.get(at..at + PER_ELEMENT)?;
+                                    if e[40] > 0.5 {
+                                        return None;
+                                    }
+                                    reach = reach.max(e[20].max(e[21]));
+                                }
+                                let m = (reach * l.scale).ceil() as u32 + 2;
+                                let (x0, y0) = (x.saturating_sub(m), y.saturating_sub(m));
+                                let (x1, y1) = ((x + w + m).min(l.px.0), (y + h + m).min(l.px.1));
+                                Some([x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0)])
+                            });
+                            pass_to(&mut encoder, view, &self.no_layers_group, &spans, false, cut, false);
+                        }
                     }
                 }
+                for pair in members.windows(2) {
+                    onto.push(pair[0].0.end..pair[1].0.start);
+                }
+                from = members[members.len() - 1].0.end;
             }
-            for pair in members.windows(2) {
-                onto.push(pair[0].0.end..pair[1].0.start);
-            }
-            from = members[members.len() - 1].0.end;
+            onto.push(from..total);
+            onto.retain(|r| !r.is_empty());
+            flush(&mut encoder, &onto, &mut keep, &mut erase, None);
         }
-        onto.push(from..total);
-        onto.retain(|r| !r.is_empty());
-        flush(&mut encoder, &onto, &mut keep, &mut erase, None);
         if let Some(lens) = &mut l.lens {
             lens.copy_to(&mut encoder, frame_texture);
+        } else if let Some(kept) = l.kept.as_ref().filter(|_| surface_only) {
+            let (w, h) = l.px;
+            encoder.copy_texture_to_texture(kept.0.as_image_copy(), frame_texture.as_image_copy(), wgpu::Extent3d { width: w.min(frame_texture.width()), height: h.min(frame_texture.height()), depth_or_array_layers: 1 });
         }
         let t1 = timing.then(std::time::Instant::now);
         let commands = encoder.finish();
@@ -3078,19 +3204,57 @@ impl Gpu {
                 v.2 += ms(t2, t3);
                 v.3 += t3.elapsed().as_secs_f32() * 1000.0;
                 v.4 += 1.0;
+                // How much of the surface was painted again: a piece, or all of it.
+                v.5 += cuts.as_ref().map_or(1.0, |c| c.iter().map(|[_, _, w, h]| *w as f32 * *h as f32).sum::<f32>() / (l.px.0 as f32 * l.px.1 as f32).max(1.0));
                 if v.4 >= 300.0 {
-                    println!("timing · acquire {:.2} · record {:.2} · finish {:.2} · submit+present {:.2} ms", v.0 / v.4, v.1 / v.4, v.2 / v.4, v.3 / v.4);
+                    println!("timing · acquire {:.2} · record {:.2} · finish {:.2} · submit+present {:.2} ms · painted again {:.0} % of the pixels", v.0 / v.4, v.1 / v.4, v.2 / v.4, v.3 / v.4, 100.0 * v.5 / v.4);
                     // What it takes up on the card: what is really requested, not the blocks the allocator reserves.
                     if let Some(r) = self.device.generate_allocator_report() {
                         println!("timing · card memory: {:.1} MB in use ({:.1} MB reserved)", r.total_allocated_bytes as f64 / 1e6, r.total_reserved_bytes as f64 / 1e6);
                     }
-                    v = (0.0, 0.0, 0.0, 0.0, 0.0);
+                    v = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
                 }
                 c.set(v);
             });
         }
         true
     }
+}
+
+/// At most this many pieces are painted again in a frame: each one is a
+/// pass over the draw list.
+const MOST_CUTS: usize = 4;
+
+/// The boxes that changed (x0, y0, x1, y1), as a few: those that overlap or
+/// almost —less than a 64 × 64 square is painted for nothing by joining
+/// them— become one, and while there are more than `MOST_CUTS`, the two that
+/// cost least to join are joined.
+fn merge_cuts(rects: impl Iterator<Item = [f32; 4]>) -> Vec<[f32; 4]> {
+    let area = |b: &[f32; 4]| (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0);
+    let join = |a: &[f32; 4], b: &[f32; 4]| [a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])];
+    let mut out: Vec<[f32; 4]> = Vec::new();
+    for r in rects.filter(|b| b[2] > b[0] && b[3] > b[1]) {
+        out.push(r);
+        loop {
+            let mut best: Option<(f32, usize, usize)> = None;
+            for i in 0..out.len() {
+                for j in i + 1..out.len() {
+                    let cost = area(&join(&out[i], &out[j])) - area(&out[i]) - area(&out[j]);
+                    if best.is_none_or(|b| cost < b.0) {
+                        best = Some((cost, i, j));
+                    }
+                }
+            }
+            match best {
+                Some((cost, i, j)) if cost < 4096.0 || out.len() > MOST_CUTS => {
+                    out[i] = join(&out[i], &out[j]);
+                    out.swap_remove(j);
+                }
+                _ => break,
+            }
+        }
+    }
+    out
 }
 
 /// The texture a frame is painted in: the swapchain's, or one lent by the platform.
@@ -3115,7 +3279,7 @@ pub fn timing_enabled() -> bool {
 }
 
 thread_local! {
-    static TIMING: std::cell::Cell<(f32, f32, f32, f32, f32)> = const { std::cell::Cell::new((0.0, 0.0, 0.0, 0.0, 0.0)) };
+    static TIMING: std::cell::Cell<(f32, f32, f32, f32, f32, f32)> = const { std::cell::Cell::new((0.0, 0.0, 0.0, 0.0, 0.0, 0.0)) };
 }
 
 impl Sheet {
@@ -3175,6 +3339,23 @@ pub const N_UNIFORMS: usize = 8 + 120 + 4 + 4;
 mod tests {
     use super::*;
     use crate::shapes::{Affine, FlatShape};
+
+    /// A bar round the screen lit at its left end and at its right end is
+    /// two pieces, not the screen; what overlaps is one; and never more than four.
+    #[test]
+    fn cuts_stay_few_and_apart() {
+        let left = [0.0, 0.0, 64.0, 1080.0];
+        let right = [1910.0, 0.0, 1920.0, 1080.0];
+        assert_eq!(merge_cuts([left, right].into_iter()), vec![left, right]);
+        assert_eq!(merge_cuts([[0.0, 0.0, 100.0, 100.0], [50.0, 50.0, 150.0, 150.0]].into_iter()), vec![[0.0, 0.0, 150.0, 150.0]]);
+        let many: Vec<[f32; 4]> = (0..9).map(|k| [k as f32 * 200.0, 0.0, k as f32 * 200.0 + 20.0, 20.0]).collect();
+        let cuts = merge_cuts(many.iter().copied());
+        assert!(cuts.len() <= MOST_CUTS);
+        for b in &many {
+            assert!(cuts.iter().any(|c| c[0] <= b[0] && c[1] <= b[1] && c[2] >= b[2] && c[3] >= b[3]), "{b:?} is left out");
+        }
+        assert!(merge_cuts([[5.0, 5.0, 5.0, 9.0]].into_iter()).is_empty());
+    }
 
     fn area(f: &[[f32; 4]]) -> f32 {
         f.iter().map(|r| (r[2] - r[0]) * (r[3] - r[1])).sum()

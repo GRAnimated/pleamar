@@ -1,0 +1,5 @@
+// expect: ok
+// A scene that declares no surface gets the default one (reading it used to be a panic).
+scene NoSurface {
+    box { from: 0, 0; size: 20, 20; color: #9ed6bd }
+}

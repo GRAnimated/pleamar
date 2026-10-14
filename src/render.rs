@@ -4091,6 +4091,9 @@ pub fn run(
         // the clock sets the next round.
         frame_requested = None;
         frame_ready = false;
+        // Painting only where something changed needs to know where: not with
+        // particles, a shader that reads the time or an image that moves.
+        let knows_where = !all_changed && !draw.timed && !draw.particles_alive && draw.particle_marks.is_empty() && draw.wake_at.is_none();
         for l in &mut sheets {
             // Closed, it is painted once, empty, and that is it: that, yes, always, whether something changes or not.
             if !l.open && std::mem::replace(&mut l.cleared, true) {
@@ -4117,7 +4120,16 @@ pub fn run(
                 appointments.push(l.capture_asked + Duration::from_millis(101));
             }
             let nudge = unseen && l.capture_asked.elapsed() >= Duration::from_millis(100);
-            let its_turn = !l.open || all_changed || nudge || l.painted != Some(where_) || changed.iter().any(|b| b[0] < v[2] && b[2] > v[0] && b[1] < v[3] && b[3] > v[1]);
+            let its_turn = !l.open || all_changed || nudge || l.painted != Some(where_) || !l.owed_damage.is_empty() || changed.iter().any(|b| b[0] < v[2] && b[2] > v[0] && b[1] < v[3] && b[3] > v[1]);
+            // A round it skips: what changed in it is owed, if it is known
+            // where; if not, it is painted whole when its turn comes.
+            let skip = |l: &mut Sheet| {
+                if knows_where && l.painted == Some(where_) {
+                    owe(l, changed.iter().copied().filter(|b| b[0] < v[2] && b[2] > v[0] && b[1] < v[3] && b[3] > v[1]));
+                } else {
+                    l.painted = None;
+                }
+            };
             if !its_turn {
                 up_to_date += 1;
                 continue;
@@ -4129,7 +4141,7 @@ pub fn run(
                 match l.capture {
                     // It arrives in less than a refresh. If it takes longer, it has been lost.
                     crate::gpu::BackdropCapture::AfterPresent if l.capture_asked.elapsed() < Duration::from_millis(100) => {
-                        l.painted = None;
+                        skip(l);
                         up_to_date += 1;
                         continue;
                     }
@@ -4151,16 +4163,16 @@ pub fn run(
                 if !owed.contains(&l.id) {
                     owed.push(l.id);
                 }
-                // What changed meanwhile is not lost: it is painted whole when its turn comes.
-                l.painted = None;
+                // What changed meanwhile is not lost: it is painted when its turn comes.
+                skip(l);
                 up_to_date += 1;
                 continue;
             }
             owed.retain(|k| *k != l.id);
-            // Painting only where something changed needs to know where: not with
-            // particles, a shader that reads the time or an image that moves.
-            let knows_where = !all_changed && !draw.timed && !draw.particles_alive && draw.particle_marks.is_empty() && draw.wake_at.is_none();
-            let was_painted = g.paint(l, &draw, &uniforms, asks || others, (knows_where && l.painted == Some(where_)).then_some(&changed[..]));
+            // And what it owes.
+            let with_owed: Option<Vec<[f32; 4]>> = (!l.owed_damage.is_empty()).then(|| changed.iter().chain(&l.owed_damage).copied().collect());
+            l.owed_damage.clear();
+            let was_painted = g.paint(l, &draw, &uniforms, asks || others, (knows_where && l.painted == Some(where_)).then(|| with_owed.as_deref().unwrap_or(&changed[..])));
             if was_painted && others && answers.contains(&l.id) {
                 in_flight.retain(|f| f.0 != l.id);
                 in_flight.push((l.id, Instant::now()));
@@ -4525,6 +4537,16 @@ fn plain_key(name: &str) -> String {
 /// canvas that was presented. If something has changed, it has to be painted again (and
 /// after painting it another will be asked for); if not, it watches until something changes behind.
 /// Returns whether it has to paint.
+/// What changed in a sheet's piece that it has not painted yet (`Sheet::owed_damage`).
+/// Past a few dozen boxes, one round them all.
+fn owe(l: &mut Sheet, rects: impl Iterator<Item = [f32; 4]>) {
+    l.owed_damage.extend(rects);
+    if l.owed_damage.len() > 32 {
+        let u = l.owed_damage.iter().fold([f32::MAX, f32::MAX, f32::MIN, f32::MIN], |u, b| [u[0].min(b[0]), u[1].min(b[1]), u[2].max(b[2]), u[3].max(b[3])]);
+        l.owed_damage = vec![u];
+    }
+}
+
 fn handle_backdrop(g: &Gpu, sheets: &mut [Sheet], d: Box<crate::platform::Backdrop>) -> bool {
     let Some(l) = sheets.iter_mut().find(|l| l.id == d.sheet) else { return false };
     l.capture = crate::gpu::BackdropCapture::Idle;
@@ -4532,7 +4554,10 @@ fn handle_backdrop(g: &Gpu, sheets: &mut [Sheet], d: Box<crate::platform::Backdr
         return false;
     }
     if g.receive_backdrop(l, *d) {
-        l.painted = None;
+        // Only the glass sees it, and the glass is inside the box captured.
+        let (o, b) = (l.view.origin, l.asked_box);
+        let r = [o.0 + b[0] as f32, o.1 + b[1] as f32, o.0 + (b[0] + b[2]) as f32, o.1 + (b[1] + b[3]) as f32];
+        owe(l, [r].into_iter());
         true
     } else {
         l.request_backdrop(true);

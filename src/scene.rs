@@ -902,6 +902,9 @@ pub struct GroupShader {
     pub shader: u16,
     pub values: Vec<Expr>,
     pub time: Option<Expr>,
+    /// `… while bending`: only while that holds. Otherwise the group is
+    /// painted as if it had no shader, and without its pass if nothing else asks for one.
+    pub on: Option<Expr>,
 }
 
 /// Where a group can be seen: whole at the start, nothing at the end.
