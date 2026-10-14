@@ -514,6 +514,8 @@ pub fn run(
     let mut follows = Follows::default();
     // The facts as they were when what is bound was last computed (see the rules).
     let mut facts_at_binds: Vec<f32> = Vec::new();
+    // Who reads what, to ask only those whose inputs changed.
+    let mut readers = Readers::default();
     let mut pending: Vec<(Instant, Transition)> = Vec::new();
     let mut layers: Vec<LayerState> = Vec::new();
     let mut rules: Vec<RuleState> = Vec::new();
@@ -2500,12 +2502,16 @@ pub fn run(
         // went back to its tile.
         if facts != facts_at_binds {
             follows.begin(&scene.behaviors);
+            readers.look(0, &scene.behaviors, &facts, &props, &absent_behaviors);
             for (k, behavior) in scene.behaviors.iter().enumerate() {
                 if let Behavior::Bind { prop, to } = behavior {
-                    if absent_behaviors.iter().any(|r| r.contains(&k)) {
+                    if !readers.dirty[k] || absent_behaviors.iter().any(|r| r.contains(&k)) {
                         continue;
                     }
                     let v = follows.value(k, to, &props, &facts);
+                    if props[prop.0 as usize].x.to_bits() != v.to_bits() {
+                        readers.touch(*prop);
+                    }
                     props[prop.0 as usize].set(v);
                 }
             }
@@ -3053,7 +3059,11 @@ pub fn run(
         }
         let mut n_blink = 0;
         follows.begin(&scene.behaviors);
+        readers.look(1, &scene.behaviors, &facts, &props, &absent_behaviors);
         for (k, behavior) in scene.behaviors.iter().enumerate() {
+            if let Behavior::Blink { prop, .. } | Behavior::Wave { prop, .. } | Behavior::Advance { prop, .. } = behavior {
+                readers.touch(*prop);
+            }
             match behavior {
                 Behavior::Blink { prop, every, duration } => {
                     let (next, since) = &mut blinks[n_blink];
@@ -3117,11 +3127,14 @@ pub fn run(
                 }
                 Behavior::Follow { .. } | Behavior::Bind { .. } if absent_behaviors.iter().any(|r| r.contains(&k)) => {}
                 Behavior::Follow { prop, to } => {
-                    let v = follows.value(k, to, &props, &facts);
+                    let v = follows.kept_or_value(readers.dirty[k], k, to, &props, &facts);
                     props[prop.0 as usize].target = v;
                 }
                 Behavior::Bind { prop, to } => {
-                    let v = follows.value(k, to, &props, &facts);
+                    let v = follows.kept_or_value(readers.dirty[k], k, to, &props, &facts);
+                    if props[prop.0 as usize].x.to_bits() != v.to_bits() {
+                        readers.touch(*prop);
+                    }
                     let p = &mut props[prop.0 as usize];
                     alive |= (p.x - v).abs() > 1e-3;
                     if timing && (p.x - v).abs() > 1e-3 {
@@ -3247,12 +3260,16 @@ pub fn run(
         // What it reads has seldom changed, and then it is only looked at. One
         // that did change asks for another round: whatever follows it, or is
         // decided by it, read the old one above.
+        readers.look(2, &scene.behaviors, &facts, &props, &absent_behaviors);
         for (k, behavior) in scene.behaviors.iter().enumerate() {
             if let Behavior::Bind { prop, to } = behavior {
                 if absent_behaviors.iter().any(|r| r.contains(&k)) {
                     continue;
                 }
-                let v = follows.value(k, to, &props, &facts);
+                let v = follows.kept_or_value(readers.dirty[k], k, to, &props, &facts);
+                if props[prop.0 as usize].x.to_bits() != v.to_bits() {
+                    readers.touch(*prop);
+                }
                 let p = &mut props[prop.0 as usize];
                 if (p.x - v).abs() > 1e-3 {
                     alive = true;
@@ -4944,6 +4961,153 @@ impl Follows {
         r.seen.extend(r.facts.iter().map(|h| facts[*h as usize]).chain(r.props.iter().flat_map(|p| [props[*p as usize].x, props[*p as usize].v])));
         r.value = Some(v);
         v
+    }
+}
+
+impl Follows {
+    /// What it came to last time, if what it reads has not changed since
+    /// (`changed` false, see `Readers`): not even looked at. Otherwise, worked out.
+    fn kept_or_value(&mut self, changed: bool, k: usize, to: &Expr, props: &[Animated], facts: &[f32]) -> f32 {
+        if !changed
+            && let Some(v) = self.each.get(k).and_then(Option::as_ref).and_then(|r| r.value)
+        {
+            return v;
+        }
+        self.value(k, to, props, facts)
+    }
+}
+
+/// Which `follow`s and `bind`s read each fact and each property: directly, or
+/// through the `bind`s they read (the properties big `let`s are computed in).
+/// A round asks again only those that read something that changed. Asking
+/// each one —thousands in pleamar-wm's scene— whether what it read had
+/// changed was most of a round while the mouse moved, and the mouse only
+/// moves `mouse.x` and `mouse.y`.
+#[derive(Default)]
+struct Readers {
+    /// Which scene they belong to: another one, and they are found again.
+    of: usize,
+    facts: Vec<Vec<u32>>,
+    props: Vec<Vec<u32>>,
+    /// What each pass (before the rules, the behaviors, after the springs)
+    /// saw last time: the facts, each property's value and speed, and the
+    /// parts asleep.
+    seen: [Seen3; 3],
+    /// This pass: whether each behavior reads something that changed.
+    dirty: Vec<bool>,
+}
+
+#[derive(Default)]
+struct Seen3 {
+    facts: Vec<f32>,
+    props: Vec<(f32, f32)>,
+    absent: Vec<std::ops::Range<usize>>,
+}
+
+impl Readers {
+    fn build(&mut self, behaviors: &[Behavior], n_facts: usize, n_props: usize) {
+        let bind_of: std::collections::HashMap<u16, usize> = behaviors.iter().enumerate().filter_map(|(k, b)| if let Behavior::Bind { prop, .. } = b { Some((prop.0, k)) } else { None }).collect();
+        let direct: Vec<Option<(Vec<u16>, Vec<u16>)>> = behaviors
+            .iter()
+            .map(|b| match b {
+                Behavior::Follow { to, .. } | Behavior::Bind { to, .. } => {
+                    let (mut props, mut facts) = (Vec::new(), Vec::new());
+                    to.inputs(&mut props, &mut facts);
+                    Some((facts, props))
+                }
+                _ => None,
+            })
+            .collect();
+        // Through the binds: what each one reads in the end. A bind reads only
+        // the ones declared before it (a `let` names what is above it); one
+        // that names itself, or a later one, is taken as it is.
+        let mut deep: Vec<Option<(Vec<u16>, Vec<u16>)>> = vec![None; behaviors.len()];
+        for k in 0..behaviors.len() {
+            let Some((f, p)) = &direct[k] else { continue };
+            let (mut facts, mut props) = (f.clone(), p.clone());
+            for q in p {
+                if let Some(&j) = bind_of.get(q).filter(|j| **j < k)
+                    && let Some((jf, jp)) = &deep[j]
+                {
+                    facts.extend_from_slice(jf);
+                    props.extend_from_slice(jp);
+                }
+            }
+            facts.sort_unstable();
+            facts.dedup();
+            props.sort_unstable();
+            props.dedup();
+            deep[k] = Some((facts, props));
+        }
+        self.facts = vec![Vec::new(); n_facts];
+        self.props = vec![Vec::new(); n_props];
+        for (k, d) in deep.iter().enumerate() {
+            let Some((f, p)) = d else { continue };
+            for h in f {
+                if let Some(r) = self.facts.get_mut(*h as usize) {
+                    r.push(k as u32);
+                }
+            }
+            for q in p {
+                if let Some(r) = self.props.get_mut(*q as usize) {
+                    r.push(k as u32);
+                }
+            }
+        }
+    }
+
+    /// Marks, for this pass, the behaviors that read something that changed
+    /// since it last looked: all of them the first time, with a new scene, or
+    /// when what is asleep is not what it was (what wakes has to catch up).
+    fn look(&mut self, pass: usize, behaviors: &[Behavior], facts: &[f32], props: &[Animated], absent: &[std::ops::Range<usize>]) {
+        let id = behaviors.as_ptr() as usize ^ behaviors.len();
+        if self.of != id || self.facts.len() != facts.len() || self.props.len() != props.len() {
+            self.build(behaviors, facts.len(), props.len());
+            self.of = id;
+            self.seen = Default::default();
+        }
+        let Readers { facts: by_fact, props: by_prop, seen, dirty, .. } = self;
+        let s = &mut seen[pass];
+        let all = s.facts.len() != facts.len() || s.props.len() != props.len() || s.absent != absent;
+        dirty.clear();
+        dirty.resize(behaviors.len(), all);
+        if !all {
+            for (i, (a, b)) in facts.iter().zip(&s.facts).enumerate() {
+                if a.to_bits() != b.to_bits() {
+                    for &k in &by_fact[i] {
+                        dirty[k as usize] = true;
+                    }
+                }
+            }
+            for (i, (a, b)) in props.iter().zip(&s.props).enumerate() {
+                if a.x.to_bits() != b.0.to_bits() || a.v.to_bits() != b.1.to_bits() {
+                    for &k in &by_prop[i] {
+                        dirty[k as usize] = true;
+                    }
+                }
+            }
+        }
+        s.facts.clear();
+        s.facts.extend_from_slice(facts);
+        s.props.clear();
+        s.props.extend(props.iter().map(|a| (a.x, a.v)));
+        if s.absent != absent {
+            s.absent = absent.to_vec();
+        }
+    }
+
+    /// That property is changing in the middle of the pass: whoever reads it,
+    /// further on in it, is asked again (a blink, a wave or a spin moves its
+    /// property as the behaviors go by, and Marea's eyes, made from them, were
+    /// left a frame behind).
+    fn touch(&mut self, prop: PropId) {
+        if let Some(r) = self.props.get(prop.0 as usize) {
+            for &k in r {
+                if let Some(d) = self.dirty.get_mut(k as usize) {
+                    *d = true;
+                }
+            }
+        }
     }
 }
 
